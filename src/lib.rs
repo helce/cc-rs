@@ -1709,6 +1709,17 @@ impl Build {
                         } else if target.contains("aarch64") {
                             cmd.args.push("--target=aarch64-unknown-windows-gnu".into())
                         }
+                    } else if target.starts_with("e2k") {
+                        cmd.args.push("--target=e2k64-unknown-linux-gnu".into());
+                        if target.starts_with("e2kv3") {
+                            cmd.args.push("-march=elbrus-v3".into());
+                        } else if target.starts_with("e2kv4") {
+                            cmd.args.push("-march=elbrus-v4".into());
+                        } else if target.starts_with("e2kv5") {
+                            cmd.args.push("-march=elbrus-v5".into());
+                        } else if target.starts_with("e2kv6") {
+                            cmd.args.push("-march=elbrus-v6".into());
+                        }
                     } else {
                         cmd.push_cc_arg(format!("--target={}", target).into());
                     }
@@ -2925,6 +2936,7 @@ impl Build {
             || target.contains("netbsd")
             || target.contains("openbsd")
             || target.contains("windows-gnu")
+            || target.contains("e2k")
         {
             Some(2)
         } else if target.contains("linux") {
