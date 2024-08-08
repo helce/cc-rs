@@ -247,6 +247,15 @@ mod tool;
 pub use tool::Tool;
 use tool::ToolFamily;
 
+mod target_info;
+mod tempfile;
+
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct CompilerFlag {
+    compiler: Box<Path>,
+    flag: Box<str>,
+}
+
 /// A builder for compilation of a native library.
 ///
 /// A `Build` is the main type of the `cc` crate and is used to control all the
@@ -259,7 +268,7 @@ pub struct Build {
     objects: Vec<Arc<Path>>,
     flags: Vec<Arc<str>>,
     flags_supported: Vec<Arc<str>>,
-    known_flag_support_status: Arc<Mutex<HashMap<String, bool>>>,
+    known_flag_support_status_cache: Arc<Mutex<HashMap<CompilerFlag, bool>>>,
     ar_flags: Vec<Arc<str>>,
     asm_flags: Vec<Arc<str>>,
     no_default_flags: bool,
@@ -312,6 +321,10 @@ enum ErrorKind {
     ToolNotFound,
     /// One of the function arguments failed validation.
     InvalidArgument,
+    /// No known macro is defined for the compiler when discovering tool family
+    ToolFamilyMacroNotFound,
+    /// Invalid target
+    InvalidTarget,
     #[cfg(feature = "parallel")]
     /// jobserver helpthread failure
     JobserverHelpThreadError,
@@ -378,7 +391,7 @@ impl Build {
             objects: Vec::new(),
             flags: Vec::new(),
             flags_supported: Vec::new(),
-            known_flag_support_status: Arc::new(Mutex::new(HashMap::new())),
+            known_flag_support_status_cache: Arc::new(Mutex::new(HashMap::new())),
             ar_flags: Vec::new(),
             asm_flags: Vec::new(),
             no_default_flags: false,
@@ -588,36 +601,49 @@ impl Build {
     /// `known_flag_support` field. If `is_flag_supported(flag)`
     /// is called again, the result will be read from the hash table.
     pub fn is_flag_supported(&self, flag: &str) -> Result<bool, Error> {
-        let mut known_status = self.known_flag_support_status.lock().unwrap();
-        if let Some(is_supported) = known_status.get(flag).cloned() {
+        let target = self.get_target()?;
+
+        let mut compiler = {
+            let mut cfg = Build::new();
+            cfg.flag(flag)
+                .cargo_metadata(self.cargo_output.metadata)
+                .target(&target)
+                .opt_level(0)
+                .host(&self.get_host()?)
+                .debug(false)
+                .cpp(self.cpp)
+                .cuda(self.cuda);
+            if let Some(ref c) = self.compiler {
+                cfg.compiler(c.clone());
+            }
+            cfg.try_get_compiler()?
+        };
+
+        let compiler_flag = CompilerFlag {
+            compiler: compiler.path.clone().into(),
+            flag: flag.into(),
+        };
+
+        if let Some(is_supported) = self
+            .known_flag_support_status_cache
+            .lock()
+            .unwrap()
+            .get(&compiler_flag)
+            .cloned()
+        {
             return Ok(is_supported);
         }
 
         let out_dir = self.get_out_dir()?;
         let src = self.ensure_check_file()?;
         let obj = out_dir.join("flag_check");
-        let target = self.get_target()?;
-        let host = self.get_host()?;
-        let mut cfg = Build::new();
-        cfg.flag(flag)
-            .cargo_metadata(self.cargo_output.metadata)
-            .target(&target)
-            .opt_level(0)
-            .host(&host)
-            .debug(false)
-            .cpp(self.cpp)
-            .cuda(self.cuda);
-        if let Some(ref c) = self.compiler {
-            cfg.compiler(c.clone());
-        }
-        let mut compiler = cfg.try_get_compiler()?;
 
         // Clang uses stderr for verbose output, which yields a false positive
         // result if the CFLAGS/CXXFLAGS include -v to aid in debugging.
         if compiler.family.verbose_stderr() {
             compiler.remove_arg("-v".into());
         }
-        if compiler.family == ToolFamily::Clang {
+        if compiler.is_like_clang() {
             // Avoid reporting that the arg is unsupported just because the
             // compiler complains that it wasn't used.
             compiler.push_cc_arg("-Wno-unused-command-line-argument".into());
@@ -625,17 +651,20 @@ impl Build {
 
         let mut cmd = compiler.to_command();
         let is_arm = target.contains("aarch64") || target.contains("arm");
-        let clang = compiler.family == ToolFamily::Clang;
+        let clang = compiler.is_like_clang();
         let gnu = compiler.family == ToolFamily::Gnu;
         command_add_output_file(
             &mut cmd,
             &obj,
-            self.cuda,
-            target.contains("msvc"),
-            clang,
-            gnu,
-            false,
-            is_arm,
+            CmdAddOutputFileArgs {
+                cuda: self.cuda,
+                is_assembler_msvc: false,
+                msvc: compiler.is_like_msvc(),
+                clang,
+                gnu,
+                is_asm: false,
+                is_arm,
+            },
         );
 
         // Checking for compiler flags does not require linking
@@ -646,7 +675,11 @@ impl Build {
         let output = cmd.output()?;
         let is_supported = output.status.success() && output.stderr.is_empty();
 
-        known_status.insert(flag.to_owned(), is_supported);
+        self.known_flag_support_status_cache
+            .lock()
+            .unwrap()
+            .insert(compiler_flag, is_supported);
+
         Ok(is_supported)
     }
 
@@ -1439,7 +1472,7 @@ impl Build {
 
         let pendings = Cell::new(Vec::<(
             Command,
-            String,
+            Cow<'static, Path>,
             KillOnDrop,
             parallel::job_token::JobToken,
         )>::new());
@@ -1563,18 +1596,22 @@ impl Build {
         Ok(())
     }
 
-    fn create_compile_object_cmd(&self, obj: &Object) -> Result<(Command, String), Error> {
+    fn create_compile_object_cmd(
+        &self,
+        obj: &Object,
+    ) -> Result<(Command, Cow<'static, Path>), Error> {
         let asm_ext = AsmFileExt::from_path(&obj.src);
         let is_asm = asm_ext.is_some();
         let target = self.get_target()?;
         let msvc = target.contains("msvc");
         let compiler = self.try_get_compiler()?;
-        let clang = compiler.family == ToolFamily::Clang;
+        let clang = compiler.is_like_clang();
         let gnu = compiler.family == ToolFamily::Gnu;
 
         let is_assembler_msvc = msvc && asm_ext == Some(AsmFileExt::DotAsm);
         let (mut cmd, name) = if is_assembler_msvc {
-            self.msvc_macro_assembler()?
+            let (cmd, name) = self.msvc_macro_assembler()?;
+            (cmd, Cow::Borrowed(Path::new(name)))
         } else {
             let mut cmd = compiler.to_command();
             for (a, b) in self.env.iter() {
@@ -1585,14 +1622,24 @@ impl Build {
                 compiler
                     .path
                     .file_name()
-                    .ok_or_else(|| Error::new(ErrorKind::IOError, "Failed to get compiler path."))?
-                    .to_string_lossy()
-                    .into_owned(),
+                    .ok_or_else(|| Error::new(ErrorKind::IOError, "Failed to get compiler path."))
+                    .map(PathBuf::from)
+                    .map(Cow::Owned)?,
             )
         };
         let is_arm = target.contains("aarch64") || target.contains("arm");
         command_add_output_file(
-            &mut cmd, &obj.dst, self.cuda, msvc, clang, gnu, is_asm, is_arm,
+            &mut cmd,
+            &obj.dst,
+            CmdAddOutputFileArgs {
+                cuda: self.cuda,
+                is_assembler_msvc,
+                msvc: compiler.is_like_msvc(),
+                clang,
+                gnu,
+                is_asm,
+                is_arm,
+            },
         );
         // armasm and armasm64 don't requrie -c option
         if !is_assembler_msvc || !is_arm {
@@ -1653,9 +1700,7 @@ impl Build {
         let name = compiler
             .path
             .file_name()
-            .ok_or_else(|| Error::new(ErrorKind::IOError, "Failed to get compiler path."))?
-            .to_string_lossy()
-            .into_owned();
+            .ok_or_else(|| Error::new(ErrorKind::IOError, "Failed to get compiler path."))?;
 
         Ok(run_output(&mut cmd, &name, &self.cargo_output)?)
     }
@@ -1726,7 +1771,7 @@ impl Build {
         if let Some(ref std) = self.std {
             let separator = match cmd.family {
                 ToolFamily::Msvc { .. } => ':',
-                ToolFamily::Gnu | ToolFamily::Clang => '=',
+                ToolFamily::Gnu | ToolFamily::Clang { .. } => '=',
             };
             cmd.push_cc_arg(format!("-std{}{}", separator, std).into());
         }
@@ -1819,23 +1864,23 @@ impl Build {
                     _ => {}
                 }
             }
-            ToolFamily::Gnu | ToolFamily::Clang => {
+            ToolFamily::Gnu | ToolFamily::Clang { .. } => {
                 // arm-linux-androideabi-gcc 4.8 shipped with Android NDK does
                 // not support '-Oz'
-                if opt_level == "z" && cmd.family != ToolFamily::Clang {
+                if opt_level == "z" && !cmd.is_like_clang() {
                     cmd.push_opt_unless_duplicate("-Os".into());
                 } else {
                     cmd.push_opt_unless_duplicate(format!("-O{}", opt_level).into());
                 }
 
-                if cmd.family == ToolFamily::Clang && target.contains("windows") {
+                if cmd.is_like_clang() && target.contains("windows") {
                     // Disambiguate mingw and msvc on Windows. Problem is that
                     // depending on the origin clang can default to a mismatchig
                     // run-time.
                     cmd.push_cc_arg(format!("--target={}", target).into());
                 }
 
-                if cmd.family == ToolFamily::Clang && target.contains("android") {
+                if cmd.is_like_clang() && target.contains("android") {
                     // For compatibility with code that doesn't use pre-defined `__ANDROID__` macro.
                     // If compiler used via ndk-build or cmake (officially supported build methods)
                     // this macros is defined.
@@ -1893,11 +1938,18 @@ impl Build {
 
         // Target flags
         match cmd.family {
-            ToolFamily::Clang => {
+            ToolFamily::Clang { .. } => {
                 if !cmd.has_internal_target_arg
                     && !(target.contains("android")
                         && android_clang_compiler_uses_target_arg_internally(&cmd.path))
                 {
+                    let (arch, rest) = target.split_once('-').ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidTarget,
+                            format!("Invalid target `{}`: no `-` in it", target),
+                        )
+                    })?;
+
                     if target.contains("darwin") {
                         if let Some(arch) =
                             map_darwin_target_from_rust_to_compiler_architecture(target)
@@ -1981,39 +2033,17 @@ impl Build {
                                 format!("--target={}-apple-tvos{}", arch, deployment_target).into(),
                             );
                         }
-                    } else if target.starts_with("riscv64gc-") {
+                    } else if let Ok(index) = target_info::RISCV_ARCH_MAPPING
+                        .binary_search_by_key(&arch, |(arch, _)| &arch)
+                    {
                         cmd.args.push(
-                            format!("--target={}", target.replace("riscv64gc", "riscv64")).into(),
+                            format!(
+                                "--target={}-{}",
+                                target_info::RISCV_ARCH_MAPPING[index].1,
+                                rest
+                            )
+                            .into(),
                         );
-                    } else if target.starts_with("riscv64imac-") {
-                        cmd.args.push(
-                            format!("--target={}", target.replace("riscv64imac", "riscv64")).into(),
-                        );
-                    } else if target.starts_with("riscv32gc-") {
-                        cmd.args.push(
-                            format!("--target={}", target.replace("riscv32gc", "riscv32")).into(),
-                        );
-                    } else if target.starts_with("riscv32i-") {
-                        cmd.args.push(
-                            format!("--target={}", target.replace("riscv32i", "riscv32")).into(),
-                        )
-                    } else if target.starts_with("riscv32im-") {
-                        cmd.args.push(
-                            format!("--target={}", target.replace("riscv32im", "riscv32")).into(),
-                        )
-                    } else if target.starts_with("riscv32imc-") {
-                        cmd.args.push(
-                            format!("--target={}", target.replace("riscv32imc", "riscv32")).into(),
-                        )
-                    } else if target.starts_with("riscv32imac-") {
-                        cmd.args.push(
-                            format!("--target={}", target.replace("riscv32imac", "riscv32")).into(),
-                        )
-                    } else if target.starts_with("riscv32imafc-") {
-                        cmd.args.push(
-                            format!("--target={}", target.replace("riscv32imafc", "riscv32"))
-                                .into(),
-                        )
                     } else if target.contains("uefi") {
                         if target.contains("x86_64") {
                             cmd.args.push("--target=x86_64-unknown-windows-gnu".into());
@@ -2091,14 +2121,11 @@ impl Build {
                     } else {
                         cmd.push_cc_arg(format!("--target={}", target).into());
                     }
-                } else {
-                    if target.contains("i586") {
-                        cmd.push_cc_arg("-arch:IA32".into());
-                    } else if target.contains("arm64ec") {
-                        cmd.push_cc_arg("-arm64EC".into());
-                    }
+                } else if target.contains("i586") {
+                    cmd.push_cc_arg("-arch:IA32".into());
+                } else if target.contains("arm64ec") {
+                    cmd.push_cc_arg("-arm64EC".into());
                 }
-
                 // There is a check in corecrt.h that will generate a
                 // compilation error if
                 // _ARM_WINAPI_PARTITION_DESKTOP_SDK_AVAILABLE is
@@ -2324,7 +2351,7 @@ impl Build {
         if self.cpp {
             match (self.cpp_set_stdlib.as_ref(), cmd.family) {
                 (None, _) => {}
-                (Some(stdlib), ToolFamily::Gnu) | (Some(stdlib), ToolFamily::Clang) => {
+                (Some(stdlib), ToolFamily::Gnu) | (Some(stdlib), ToolFamily::Clang { .. }) => {
                     cmd.push_cc_arg(format!("-stdlib=lib{}", stdlib).into());
                 }
                 _ => {
@@ -2346,7 +2373,7 @@ impl Build {
         }
     }
 
-    fn msvc_macro_assembler(&self) -> Result<(Command, String), Error> {
+    fn msvc_macro_assembler(&self) -> Result<(Command, &'static str), Error> {
         let target = self.get_target()?;
         let tool = if target.contains("x86_64") {
             "ml64.exe"
@@ -2399,7 +2426,7 @@ impl Build {
             cmd.arg("-safeseh");
         }
 
-        Ok((cmd, tool.to_string()))
+        Ok((cmd, tool))
     }
 
     fn assemble(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
@@ -2469,8 +2496,8 @@ impl Build {
     fn assemble_progressive(&self, dst: &Path, objs: &[&Path]) -> Result<(), Error> {
         let target = self.get_target()?;
 
-        if target.contains("msvc") {
-            let (mut cmd, program, any_flags) = self.get_ar()?;
+        let (mut cmd, program, any_flags) = self.get_ar()?;
+        if target.contains("msvc") && !program.to_string_lossy().contains("llvm-") {
             // NOTE: -out: here is an I/O flag, and so must be included even if $ARFLAGS/ar_flag is
             // in use. -nologo on the other hand is just a regular flag, and one that we'll skip if
             // the caller has explicitly dictated the flags they want. See
@@ -2489,8 +2516,6 @@ impl Build {
             cmd.args(objs);
             run(&mut cmd, &program, &self.cargo_output)?;
         } else {
-            let (mut ar, cmd, _any_flags) = self.get_ar()?;
-
             // Set an environment variable to tell the OSX archiver to ensure
             // that all dates listed in the archive are zero, improving
             // determinism of builds. AFAIK there's not really official
@@ -2513,12 +2538,16 @@ impl Build {
             //
             // In any case if this doesn't end up getting read, it shouldn't
             // cause that many issues!
-            ar.env("ZERO_AR_DATE", "1");
+            cmd.env("ZERO_AR_DATE", "1");
 
             // NOTE: We add cq here regardless of whether $ARFLAGS/ar_flag have been used because
             // it dictates the _mode_ ar runs in, which the setter of $ARFLAGS/ar_flag can't
             // dictate. See https://github.com/rust-lang/cc-rs/pull/763 for further discussion.
-            run(ar.arg("cq").arg(dst).args(objs), &cmd, &self.cargo_output)?;
+            run(
+                cmd.arg("cq").arg(dst).args(objs),
+                &program,
+                &self.cargo_output,
+            )?;
         }
 
         Ok(())
@@ -2700,11 +2729,15 @@ impl Build {
     }
 
     fn get_base_compiler(&self) -> Result<Tool, Error> {
+        let out_dir = self.get_out_dir().ok();
+        let out_dir = out_dir.as_deref();
+
         if let Some(c) = &self.compiler {
             return Ok(Tool::new(
                 (**c).to_owned(),
                 &self.cached_compiler_family,
                 &self.cargo_output,
+                out_dir,
             ));
         }
         let host = self.get_host()?;
@@ -2746,6 +2779,7 @@ impl Build {
                     driver_mode,
                     &self.cached_compiler_family,
                     &self.cargo_output,
+                    out_dir,
                 );
                 if let Some(cc_wrapper) = wrapper {
                     t.cc_wrapper_path = Some(PathBuf::from(cc_wrapper));
@@ -2764,6 +2798,7 @@ impl Build {
                             PathBuf::from("cmd"),
                             &self.cached_compiler_family,
                             &self.cargo_output,
+                            out_dir,
                         );
                         t.args.push("/c".into());
                         t.args.push(format!("{}.bat", tool).into());
@@ -2773,6 +2808,7 @@ impl Build {
                             PathBuf::from(tool),
                             &self.cached_compiler_family,
                             &self.cargo_output,
+                            out_dir,
                         ))
                     }
                 } else {
@@ -2832,6 +2868,7 @@ impl Build {
                     PathBuf::from(compiler),
                     &self.cached_compiler_family,
                     &self.cargo_output,
+                    out_dir,
                 );
                 if let Some(cc_wrapper) = Self::rustc_wrapper_fallback() {
                     t.cc_wrapper_path = Some(PathBuf::from(cc_wrapper));
@@ -2855,6 +2892,7 @@ impl Build {
                 self.cuda,
                 &self.cached_compiler_family,
                 &self.cargo_output,
+                out_dir,
             );
             nvcc_tool
                 .args
@@ -2950,16 +2988,17 @@ impl Build {
     /// Returns compiler path, optional modifier name from whitelist, and arguments vec
     fn env_tool(&self, name: &str) -> Option<(PathBuf, Option<String>, Vec<String>)> {
         let tool = match self.getenv_with_target_prefixes(name) {
-            Ok(tool) => tool,
-            Err(_) => return None,
+            Ok(tool) if !tool.trim().is_empty() => tool,
+            _ => return None,
         };
+        let tool = tool.trim();
 
         // If this is an exact path on the filesystem we don't want to do any
         // interpretation at all, just pass it on through. This'll hopefully get
         // us to support spaces-in-paths.
-        if Path::new(&*tool).exists() {
+        if Path::new(tool).exists() {
             return Some((
-                PathBuf::from(&*tool),
+                PathBuf::from(tool),
                 Self::rustc_wrapper_fallback(),
                 Vec::new(),
             ));
@@ -3051,7 +3090,7 @@ impl Build {
         }
     }
 
-    fn get_ar(&self) -> Result<(Command, String, bool), Error> {
+    fn get_ar(&self) -> Result<(Command, PathBuf, bool), Error> {
         self.try_get_archiver_and_flags()
     }
 
@@ -3084,7 +3123,7 @@ impl Build {
         Ok(self.try_get_archiver_and_flags()?.0)
     }
 
-    fn try_get_archiver_and_flags(&self) -> Result<(Command, String, bool), Error> {
+    fn try_get_archiver_and_flags(&self) -> Result<(Command, PathBuf, bool), Error> {
         let (mut cmd, name) = self.get_base_archiver()?;
         let mut any_flags = false;
         if let Ok(flags) = self.envflags("ARFLAGS") {
@@ -3098,12 +3137,14 @@ impl Build {
         Ok((cmd, name, any_flags))
     }
 
-    fn get_base_archiver(&self) -> Result<(Command, String), Error> {
+    fn get_base_archiver(&self) -> Result<(Command, PathBuf), Error> {
         if let Some(ref a) = self.archiver {
-            return Ok((self.cmd(&**a), a.to_string_lossy().into_owned()));
+            let archiver = &**a;
+            return Ok((self.cmd(archiver), archiver.into()));
         }
 
         self.get_base_archiver_variant("AR", "ar")
+            .map(|(cmd, archiver)| (cmd, archiver.into()))
     }
 
     /// Get the ranlib that's in use for this configuration.
@@ -3147,12 +3188,17 @@ impl Build {
         Ok(self.get_base_archiver_variant("RANLIB", "ranlib")?.0)
     }
 
-    fn get_base_archiver_variant(&self, env: &str, tool: &str) -> Result<(Command, String), Error> {
+    fn get_base_archiver_variant(
+        &self,
+        env: &str,
+        tool: &str,
+    ) -> Result<(Command, PathBuf), Error> {
         let target = self.get_target()?;
-        let mut name = String::new();
+        let mut name = PathBuf::new();
         let tool_opt: Option<Command> = self
             .env_tool(env)
             .map(|(tool, _wrapper, args)| {
+                name = tool.clone();
                 let mut cmd = self.cmd(tool);
                 cmd.args(args);
                 cmd
@@ -3162,11 +3208,11 @@ impl Build {
                     // Windows use bat files so we have to be a bit more specific
                     if cfg!(windows) {
                         let mut cmd = self.cmd("cmd");
-                        name = format!("em{}.bat", tool);
+                        name = format!("em{}.bat", tool).into();
                         cmd.arg("/c").arg(&name);
                         Some(cmd)
                     } else {
-                        name = format!("em{}", tool);
+                        name = format!("em{}", tool).into();
                         Some(self.cmd(&name))
                     }
                 } else if target.starts_with("wasm32") {
@@ -3176,8 +3222,8 @@ impl Build {
                     // And even extend it to gcc targets by searching for "ar" instead
                     // of "llvm-ar"...
                     let compiler = self.get_base_compiler().ok()?;
-                    if compiler.family == ToolFamily::Clang {
-                        name = format!("llvm-{}", tool);
+                    if compiler.is_like_clang() {
+                        name = format!("llvm-{}", tool).into();
                         search_programs(&mut self.cmd(&compiler.path), &name, &self.cargo_output)
                             .map(|name| self.cmd(name))
                     } else {
@@ -3193,10 +3239,10 @@ impl Build {
             Some(t) => t,
             None => {
                 if target.contains("android") {
-                    name = format!("llvm-{}", tool);
+                    name = format!("llvm-{}", tool).into();
                     match Command::new(&name).arg("--version").status() {
                         Ok(status) if status.success() => (),
-                        _ => name = format!("{}-{}", target.replace("armv7", "arm"), tool),
+                        _ => name = format!("{}-{}", target.replace("armv7", "arm"), tool).into(),
                     }
                     self.cmd(&name)
                 } else if target.contains("msvc") {
@@ -3223,7 +3269,7 @@ impl Build {
                     }
 
                     if lib.is_empty() {
-                        name = String::from("lib.exe");
+                        name = PathBuf::from("lib.exe");
                         let mut cmd = match windows_registry::find(&target, "lib.exe") {
                             Some(t) => t,
                             None => self.cmd("lib.exe"),
@@ -3233,7 +3279,7 @@ impl Build {
                         }
                         cmd
                     } else {
-                        name = lib;
+                        name = lib.into();
                         self.cmd(&name)
                     }
                 } else if target.contains("illumos") {
@@ -3241,7 +3287,7 @@ impl Build {
                     // but the OS comes bundled with a GNU-compatible variant.
                     //
                     // Use the GNU-variant to match other Unix systems.
-                    name = format!("g{}", tool);
+                    name = format!("g{}", tool).into();
                     self.cmd(&name)
                 } else if self.get_host()? != target {
                     match self.prefix_for_target(&target) {
@@ -3261,16 +3307,16 @@ impl Build {
                                     break;
                                 }
                             }
-                            name = chosen;
+                            name = chosen.into();
                             self.cmd(&name)
                         }
                         None => {
-                            name = default;
+                            name = default.into();
                             self.cmd(&name)
                         }
                     }
                 } else {
-                    name = default;
+                    name = default.into();
                     self.cmd(&name)
                 }
             }
@@ -3434,12 +3480,11 @@ impl Build {
                 })
             })
             .map(|prefix| *prefix)
-            .or_else(||
             // If no toolchain was found, provide the first toolchain that was passed in.
             // This toolchain has been shown not to exist, however it will appear in the
             // error that is shown to the user which should make it easier to search for
             // where it should be obtained.
-            prefixes.first().map(|prefix| *prefix))
+            .or_else(|| prefixes.first().map(|prefix| *prefix))
     }
 
     fn get_target(&self) -> Result<Arc<str>, Error> {
@@ -3774,6 +3819,7 @@ enum AppleOs {
     WatchOs,
     TvOs,
 }
+
 impl std::fmt::Debug for AppleOs {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -3963,7 +4009,7 @@ fn which(tool: &Path, path_entries: Option<OsString>) -> Option<PathBuf> {
 }
 
 // search for |prog| on 'programs' path in '|cc| -print-search-dirs' output
-fn search_programs(cc: &mut Command, prog: &str, cargo_output: &CargoOutput) -> Option<PathBuf> {
+fn search_programs(cc: &mut Command, prog: &Path, cargo_output: &CargoOutput) -> Option<PathBuf> {
     let search_dirs = run_output(
         cc.arg("-print-search-dirs"),
         "cc",
@@ -3976,7 +4022,7 @@ fn search_programs(cc: &mut Command, prog: &str, cargo_output: &CargoOutput) -> 
     let search_dirs = std::str::from_utf8(&search_dirs).ok()?;
     for dirs in search_dirs.split(|c| c == '\r' || c == '\n') {
         if let Some(path) = dirs.strip_prefix("programs: =") {
-            return which(Path::new(prog), Some(OsString::from(path)));
+            return which(prog, Some(OsString::from(path)));
         }
     }
     None
