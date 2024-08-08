@@ -23,7 +23,7 @@ const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 const NOOP_RAW_WAKER: RawWaker = RawWaker::new(ptr::null(), &NOOP_WAKER_VTABLE);
 
 #[derive(Default)]
-pub(super) struct YieldOnce(bool);
+pub(crate) struct YieldOnce(bool);
 
 impl Future for YieldOnce {
     type Output = ();
@@ -44,7 +44,7 @@ impl Future for YieldOnce {
 /// Here we use our own homebrew async executor since cc is used in the build
 /// script of many popular projects, pulling in additional dependencies would
 /// significantly slow down its compilation.
-pub(super) fn block_on<Fut1, Fut2>(
+pub(crate) fn block_on<Fut1, Fut2>(
     mut fut1: Fut1,
     mut fut2: Fut2,
     has_made_progress: &Cell<bool>,
@@ -63,7 +63,7 @@ where
     let mut fut2 = Some(unsafe { Pin::new_unchecked(&mut fut2) });
 
     // TODO: Once `Waker::noop` stablised and our MSRV is bumped to the version
-    // which it is stablised, replace this wth `Waker::noop`.
+    // which it is stablised, replace this with `Waker::noop`.
     let waker = unsafe { Waker::from_raw(NOOP_RAW_WAKER) };
     let mut context = Context::from_waker(&waker);
 

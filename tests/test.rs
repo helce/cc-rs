@@ -24,7 +24,8 @@ fn gnu_smoke() {
         .must_have("-c")
         .must_have("-ffunction-sections")
         .must_have("-fdata-sections");
-    test.cmd(1).must_have(test.td.path().join("foo.o"));
+    test.cmd(1)
+        .must_have(test.td.path().join("d1fba762150c532c-foo.o"));
 }
 
 #[test]
@@ -259,8 +260,8 @@ fn gnu_x86_64_no_plt() {
     test.gcc()
         .pic(true)
         .use_plt(false)
-        .target(&target)
-        .host(&target)
+        .target(target)
+        .host(target)
         .file("foo.c")
         .compile("foo");
     test.cmd(0).must_have("-fno-plt");
@@ -399,7 +400,8 @@ fn msvc_smoke() {
         .must_not_have("-Z7")
         .must_have("-c")
         .must_have("-MD");
-    test.cmd(1).must_have(test.td.path().join("foo.o"));
+    test.cmd(1)
+        .must_have(test.td.path().join("d1fba762150c532c-foo.o"));
 }
 
 #[test]
@@ -496,7 +498,7 @@ fn gnu_apple_darwin() {
         test.gcc()
             .target(&target)
             .host(&target)
-            // Avoid test maintainence when minimum supported OSes change.
+            // Avoid test maintenance when minimum supported OSes change.
             .__set_env("MACOSX_DEPLOYMENT_TARGET", version)
             .file("foo.c")
             .compile("foo");
@@ -510,10 +512,69 @@ fn gnu_apple_darwin() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn macos_cpp_minimums() {
+    let versions = &[
+        // Too low
+        ("10.7", (10, 9)),
+        // Minimum
+        ("10.9", (10, 9)),
+        // Higher
+        ("11.0", (11, 0)),
+    ];
+
+    let target = "x86_64-apple-darwin";
+    for (deployment_target, set_version) in versions {
+        let test = Test::gnu();
+        test.gcc()
+            .target(target)
+            .host(target)
+            .cpp(true)
+            .__set_env("MACOSX_DEPLOYMENT_TARGET", deployment_target)
+            .file("foo.c")
+            .compile("foo");
+
+        let exec = test.cmd(0);
+        let deployment_arg = exec
+            .args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("-mmacosx-version-min="))
+            .expect("no deployment target argument was set");
+
+        let mut deployment_parts = deployment_arg.split('.').map(|v| v.parse::<u32>().unwrap());
+
+        let major = deployment_parts.next().unwrap();
+        let minor = deployment_parts.next().unwrap();
+
+        // Check that we are on at least our minimums since this test reads from system
+        // SDK state, and that can vary per-system. It should never go lower then the deployment
+        // target we pass.
+        assert!(major >= set_version.0);
+
+        // If still on 10.x make sure `x` didn't go lower.
+        if major == set_version.0 {
+            assert!(minor >= set_version.1);
+        }
+    }
+
+    let test = Test::gnu();
+    test.gcc()
+        .target(target)
+        .host(target)
+        .__set_env("MACOSX_DEPLOYMENT_TARGET", "10.7")
+        .file("foo.c")
+        .compile("foo");
+
+    // No C++ leaves it untouched
+    test.cmd(0).must_have("-mmacosx-version-min=10.7");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn clang_apple_tvos() {
     for target in &["aarch64-apple-tvos"] {
         let test = Test::clang();
         test.gcc()
+            .__set_env("TVOS_DEPLOYMENT_TARGET", "9.0")
             .target(&target)
             .host(&target)
             .file("foo.c")
@@ -529,6 +590,7 @@ fn clang_apple_tvsimulator() {
     for target in &["x86_64-apple-tvos"] {
         let test = Test::clang();
         test.gcc()
+            .__set_env("TVOS_DEPLOYMENT_TARGET", "9.0")
             .target(&target)
             .host(&target)
             .file("foo.c")
@@ -536,4 +598,22 @@ fn clang_apple_tvsimulator() {
 
         test.cmd(0).must_have("-mappletvsimulator-version-min=9.0");
     }
+}
+
+#[test]
+fn compile_intermediates() {
+    let test = Test::gnu();
+    let intermediates = test
+        .gcc()
+        .file("foo.c")
+        .file("x86_64.asm")
+        .file("x86_64.S")
+        .asm_flag("--abc")
+        .compile_intermediates();
+
+    assert_eq!(intermediates.len(), 3);
+
+    assert!(intermediates[0].display().to_string().contains("foo"));
+    assert!(intermediates[1].display().to_string().contains("x86_64"));
+    assert!(intermediates[2].display().to_string().contains("x86_64"));
 }

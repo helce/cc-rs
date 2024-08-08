@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::windows_sys::{
+use crate::windows::windows_sys::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, ERROR_NO_MORE_ITEMS,
     ERROR_SUCCESS, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, REG_SZ,
 };
@@ -23,6 +23,7 @@ use std::{
 /// Must never be `HKEY_PERFORMANCE_DATA`.
 pub(crate) struct RegistryKey(Repr);
 
+#[allow(clippy::upper_case_acronyms)]
 type DWORD = u32;
 
 struct OwnedKey(HKEY);
@@ -147,7 +148,7 @@ impl RegistryKey {
             if !v.is_empty() && v[v.len() - 1] == 0 {
                 v.pop();
             }
-            return Ok(OsString::from_wide(&v));
+            Ok(OsString::from_wide(&v))
         }
     }
 }

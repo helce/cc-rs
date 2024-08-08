@@ -17,7 +17,7 @@ pub struct Test {
 }
 
 pub struct Execution {
-    args: Vec<String>,
+    pub args: Vec<String>,
 }
 
 impl Test {
@@ -34,7 +34,7 @@ impl Test {
         // lesser of the two evils.
         env::remove_var("RUSTC_WRAPPER");
 
-        let mut gcc = PathBuf::from(env::current_exe().unwrap());
+        let mut gcc = env::current_exe().unwrap();
         gcc.pop();
         if gcc.ends_with("deps") {
             gcc.pop();
@@ -42,8 +42,8 @@ impl Test {
         let td = Builder::new().prefix("gcc-test").tempdir_in(&gcc).unwrap();
         gcc.push(format!("gcc-shim{}", env::consts::EXE_SUFFIX));
         Test {
-            td: td,
-            gcc: gcc,
+            td,
+            gcc,
             msvc: false,
         }
     }

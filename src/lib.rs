@@ -1,50 +1,214 @@
-//! A library for build scripts to compile custom C code
+//! A library for [Cargo build scripts](https://doc.rust-lang.org/cargo/reference/build-scripts.html)
+//! to compile a set of C/C++/assembly/CUDA files into a static archive for Cargo
+//! to link into the crate being built. This crate does not compile code itself;
+//! it calls out to the default compiler for the platform. This crate will
+//! automatically detect situations such as cross compilation and
+//! [various environment variables](#external-configuration-via-environment-variables) and will build code appropriately.
 //!
-//! This library is intended to be used as a `build-dependencies` entry in
-//! `Cargo.toml`:
+//! # Example
+//!
+//! First, you'll want to both add a build script for your crate (`build.rs`) and
+//! also add this crate to your `Cargo.toml` via:
 //!
 //! ```toml
 //! [build-dependencies]
 //! cc = "1.0"
 //! ```
 //!
-//! The purpose of this crate is to provide the utility functions necessary to
-//! compile C code into a static archive which is then linked into a Rust crate.
-//! Configuration is available through the `Build` struct.
+//! Next up, you'll want to write a build script like so:
 //!
-//! This crate will automatically detect situations such as cross compilation or
-//! other environment variables set by Cargo and will build code appropriately.
+//! ```rust,no_run
+//! // build.rs
 //!
-//! The crate is not limited to C code, it can accept any source code that can
-//! be passed to a C or C++ compiler. As such, assembly files with extensions
-//! `.s` (gcc/clang) and `.asm` (MSVC) can also be compiled.
+//! fn main() {
+//!     cc::Build::new()
+//!         .file("foo.c")
+//!         .file("bar.c")
+//!         .compile("foo");
+//! }
+//! ```
 //!
-//! [`Build`]: struct.Build.html
+//! And that's it! Running `cargo build` should take care of the rest and your Rust
+//! application will now have the C files `foo.c` and `bar.c` compiled into a file
+//! named `libfoo.a`. If the C files contain
 //!
-//! # Parallelism
+//! ```c
+//! void foo_function(void) { ... }
+//! ```
 //!
-//! To parallelize computation, enable the `parallel` feature for the crate.
+//! and
+//!
+//! ```c
+//! int32_t bar_function(int32_t x) { ... }
+//! ```
+//!
+//! you can call them from Rust by declaring them in
+//! your Rust code like so:
+//!
+//! ```rust,no_run
+//! extern "C" {
+//!     fn foo_function();
+//!     fn bar_function(x: i32) -> i32;
+//! }
+//!
+//! pub fn call() {
+//!     unsafe {
+//!         foo_function();
+//!         bar_function(42);
+//!     }
+//! }
+//!
+//! fn main() {
+//!     call();
+//! }
+//! ```
+//!
+//! See [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html) for more details.
+//!
+//! # External configuration via environment variables
+//!
+//! To control the programs and flags used for building, the builder can set a
+//! number of different environment variables.
+//!
+//! * `CFLAGS` - a series of space separated flags passed to compilers. Note that
+//! individual flags cannot currently contain spaces, so doing
+//! something like: `-L=foo\ bar` is not possible.
+//! * `CC` - the actual C compiler used. Note that this is used as an exact
+//! executable name, so (for example) no extra flags can be passed inside
+//! this variable, and the builder must ensure that there aren't any
+//! trailing spaces. This compiler must understand the `-c` flag. For
+//! certain `TARGET`s, it also is assumed to know about other flags (most
+//! common is `-fPIC`).
+//! * `AR` - the `ar` (archiver) executable to use to build the static library.
+//! * `CRATE_CC_NO_DEFAULTS` - the default compiler flags may cause conflicts in
+//! some cross compiling scenarios. Setting this variable
+//! will disable the generation of default compiler
+//! flags.
+//! * `CXX...` - see [C++ Support](#c-support).
+//!
+//! Furthermore, projects using this crate may specify custom environment variables
+//! to be inspected, for example via the `Build::try_flags_from_environment`
+//! function. Consult the project’s own documentation or its use of the `cc` crate
+//! for any additional variables it may use.
+//!
+//! Each of these variables can also be supplied with certain prefixes and suffixes,
+//! in the following prioritized order:
+//!
+//!   1. `<var>_<target>` - for example, `CC_x86_64-unknown-linux-gnu`
+//!   2. `<var>_<target_with_underscores>` - for example, `CC_x86_64_unknown_linux_gnu`
+//!   3. `<build-kind>_<var>` - for example, `HOST_CC` or `TARGET_CFLAGS`
+//!   4. `<var>` - a plain `CC`, `AR` as above.
+//!
+//! If none of these variables exist, cc-rs uses built-in defaults.
+//!
+//! In addition to the above optional environment variables, `cc-rs` has some
+//! functions with hard requirements on some variables supplied by [cargo's
+//! build-script driver][cargo] that it has the `TARGET`, `OUT_DIR`, `OPT_LEVEL`,
+//! and `HOST` variables.
+//!
+//! [cargo]: https://doc.rust-lang.org/cargo/reference/build-scripts.html#inputs-to-the-build-script
+//!
+//! # Optional features
+//!
+//! ## Parallel
+//!
+//! Currently cc-rs supports parallel compilation (think `make -jN`) but this
+//! feature is turned off by default. To enable cc-rs to compile C/C++ in parallel,
+//! you can change your dependency to:
 //!
 //! ```toml
 //! [build-dependencies]
 //! cc = { version = "1.0", features = ["parallel"] }
 //! ```
-//! To specify the max number of concurrent compilation jobs, set the `NUM_JOBS`
-//! environment variable to the desired amount.
 //!
-//! Cargo will also set this environment variable when executed with the `-jN` flag.
+//! By default cc-rs will limit parallelism to `$NUM_JOBS`, or if not present it
+//! will limit it to the number of cpus on the machine. If you are using cargo,
+//! use `-jN` option of `build`, `test` and `run` commands as `$NUM_JOBS`
+//! is supplied by cargo.
 //!
-//! # Examples
+//! # Compile-time Requirements
 //!
-//! Use the `Build` struct to compile `src/foo.c`:
+//! To work properly this crate needs access to a C compiler when the build script
+//! is being run. This crate does not ship a C compiler with it. The compiler
+//! required varies per platform, but there are three broad categories:
 //!
-//! ```no_run
+//! * Unix platforms require `cc` to be the C compiler. This can be found by
+//! installing cc/clang on Linux distributions and Xcode on macOS, for example.
+//! * Windows platforms targeting MSVC (e.g. your target triple ends in `-msvc`)
+//! require Visual Studio to be installed. `cc-rs` attempts to locate it, and
+//! if it fails, `cl.exe` is expected to be available in `PATH`. This can be
+//! set up by running the appropriate developer tools shell.
+//! * Windows platforms targeting MinGW (e.g. your target triple ends in `-gnu`)
+//! require `cc` to be available in `PATH`. We recommend the
+//! [MinGW-w64](https://www.mingw-w64.org/) distribution, which is using the
+//! [Win-builds](http://win-builds.org/) installation system.
+//! You may also acquire it via
+//! [MSYS2](https://www.msys2.org/), as explained [here][msys2-help].  Make sure
+//! to install the appropriate architecture corresponding to your installation of
+//! rustc. GCC from older [MinGW](http://www.mingw.org/) project is compatible
+//! only with 32-bit rust compiler.
+//!
+//! [msys2-help]: https://github.com/rust-lang/rust#building-on-windows
+//!
+//! # C++ support
+//!
+//! `cc-rs` supports C++ libraries compilation by using the `cpp` method on
+//! `Build`:
+//!
+//! ```rust,no_run
 //! fn main() {
 //!     cc::Build::new()
-//!         .file("src/foo.c")
-//!         .define("FOO", Some("bar"))
-//!         .include("src")
+//!         .cpp(true) // Switch to C++ library compilation.
+//!         .file("foo.cpp")
 //!         .compile("foo");
+//! }
+//! ```
+//!
+//! For C++ libraries, the `CXX` and `CXXFLAGS` environment variables are used instead of `CC` and `CFLAGS`.
+//!
+//! The C++ standard library may be linked to the crate target. By default it's `libc++` for macOS, FreeBSD, and OpenBSD, `libc++_shared` for Android, nothing for MSVC, and `libstdc++` for anything else. It can be changed in one of two ways:
+//!
+//! 1. by using the `cpp_link_stdlib` method on `Build`:
+//! ```rust,no_run
+//! fn main() {
+//!     cc::Build::new()
+//!         .cpp(true)
+//!         .file("foo.cpp")
+//!         .cpp_link_stdlib("stdc++") // use libstdc++
+//!         .compile("foo");
+//! }
+//! ```
+//! 2. by setting the `CXXSTDLIB` environment variable.
+//!
+//! In particular, for Android you may want to [use `c++_static` if you have at most one shared library](https://developer.android.com/ndk/guides/cpp-support).
+//!
+//! Remember that C++ does name mangling so `extern "C"` might be required to enable Rust linker to find your functions.
+//!
+//! # CUDA C++ support
+//!
+//! `cc-rs` also supports compiling CUDA C++ libraries by using the `cuda` method
+//! on `Build`:
+//!
+//! ```rust,no_run
+//! fn main() {
+//!     cc::Build::new()
+//!         // Switch to CUDA C++ library compilation using NVCC.
+//!         .cuda(true)
+//!         .cudart("static")
+//!         // Generate code for Maxwell (GTX 970, 980, 980 Ti, Titan X).
+//!         .flag("-gencode").flag("arch=compute_52,code=sm_52")
+//!         // Generate code for Maxwell (Jetson TX1).
+//!         .flag("-gencode").flag("arch=compute_53,code=sm_53")
+//!         // Generate code for Pascal (GTX 1070, 1080, 1080 Ti, Titan Xp).
+//!         .flag("-gencode").flag("arch=compute_61,code=sm_61")
+//!         // Generate code for Pascal (Tesla P100).
+//!         .flag("-gencode").flag("arch=compute_60,code=sm_60")
+//!         // Generate code for Pascal (Jetson TX2).
+//!         .flag("-gencode").flag("arch=compute_62,code=sm_62")
+//!         // Generate code in parallel
+//!         .flag("-t0")
+//!         .file("bar.cu")
+//!         .compile("bar");
 //! }
 //! ```
 
@@ -54,40 +218,31 @@
 #![deny(missing_docs)]
 
 use std::borrow::Cow;
-use std::collections::{hash_map, HashMap};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Display, Formatter};
-use std::fs::{self, File};
-use std::hash::Hasher;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(feature = "parallel")]
+use std::process::Child;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 
 #[cfg(feature = "parallel")]
-mod async_executor;
-#[cfg(feature = "parallel")]
-mod job_token;
-mod os_pipe;
-// These modules are all glue to support reading the MSVC version from
-// the registry and from COM interfaces
-#[cfg(windows)]
-mod registry;
-#[cfg(windows)]
-#[macro_use]
-mod winapi;
-#[cfg(windows)]
-mod com;
-#[cfg(windows)]
-mod setup_config;
-#[cfg(windows)]
-mod vs_instances;
-#[cfg(windows)]
-mod windows_sys;
+mod parallel;
+mod windows;
+// Regardless of whether this should be in this crate's public API,
+// it has been since 2015, so don't break it.
+pub use windows::find_tools as windows_registry;
 
-pub mod windows_registry;
+mod command_helpers;
+use command_helpers::*;
+
+mod tool;
+pub use tool::Tool;
+use tool::ToolFamily;
 
 /// A builder for compilation of a native library.
 ///
@@ -122,7 +277,7 @@ pub struct Build {
     compiler: Option<Arc<Path>>,
     archiver: Option<Arc<Path>>,
     ranlib: Option<Arc<Path>>,
-    cargo_metadata: bool,
+    cargo_output: CargoOutput,
     link_lib_modifiers: Vec<Arc<str>>,
     pic: Option<bool>,
     use_plt: Option<bool>,
@@ -134,6 +289,7 @@ pub struct Build {
     extra_warnings: Option<bool>,
     env_cache: Arc<Mutex<HashMap<String, Option<Arc<str>>>>>,
     apple_sdk_root_cache: Arc<Mutex<HashMap<String, OsString>>>,
+    apple_versions_cache: Arc<Mutex<HashMap<String, String>>>,
     emit_rerun_if_env_changed: bool,
 }
 
@@ -186,98 +342,6 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Configuration used to represent an invocation of a C compiler.
-///
-/// This can be used to figure out what compiler is in use, what the arguments
-/// to it are, and what the environment variables look like for the compiler.
-/// This can be used to further configure other build systems (e.g. forward
-/// along CC and/or CFLAGS) or the `to_command` method can be used to run the
-/// compiler itself.
-#[derive(Clone, Debug)]
-pub struct Tool {
-    path: PathBuf,
-    cc_wrapper_path: Option<PathBuf>,
-    cc_wrapper_args: Vec<OsString>,
-    args: Vec<OsString>,
-    env: Vec<(OsString, OsString)>,
-    family: ToolFamily,
-    cuda: bool,
-    removed_args: Vec<OsString>,
-    has_internal_target_arg: bool,
-}
-
-/// Represents the family of tools this tool belongs to.
-///
-/// Each family of tools differs in how and what arguments they accept.
-///
-/// Detection of a family is done on best-effort basis and may not accurately reflect the tool.
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum ToolFamily {
-    /// Tool is GNU Compiler Collection-like.
-    Gnu,
-    /// Tool is Clang-like. It differs from the GCC in a sense that it accepts superset of flags
-    /// and its cross-compilation approach is different.
-    Clang,
-    /// Tool is the MSVC cl.exe.
-    Msvc { clang_cl: bool },
-}
-
-impl ToolFamily {
-    /// What the flag to request debug info for this family of tools look like
-    fn add_debug_flags(&self, cmd: &mut Tool, dwarf_version: Option<u32>) {
-        match *self {
-            ToolFamily::Msvc { .. } => {
-                cmd.push_cc_arg("-Z7".into());
-            }
-            ToolFamily::Gnu | ToolFamily::Clang => {
-                cmd.push_cc_arg(
-                    dwarf_version
-                        .map_or_else(|| "-g".into(), |v| format!("-gdwarf-{}", v))
-                        .into(),
-                );
-            }
-        }
-    }
-
-    /// What the flag to force frame pointers.
-    fn add_force_frame_pointer(&self, cmd: &mut Tool) {
-        match *self {
-            ToolFamily::Gnu | ToolFamily::Clang => {
-                cmd.push_cc_arg("-fno-omit-frame-pointer".into());
-            }
-            _ => (),
-        }
-    }
-
-    /// What the flags to enable all warnings
-    fn warnings_flags(&self) -> &'static str {
-        match *self {
-            ToolFamily::Msvc { .. } => "-W4",
-            ToolFamily::Gnu | ToolFamily::Clang => "-Wall",
-        }
-    }
-
-    /// What the flags to enable extra warnings
-    fn extra_warnings_flags(&self) -> Option<&'static str> {
-        match *self {
-            ToolFamily::Msvc { .. } => None,
-            ToolFamily::Gnu | ToolFamily::Clang => Some("-Wextra"),
-        }
-    }
-
-    /// What the flag to turn warning into errors
-    fn warnings_to_errors_flag(&self) -> &'static str {
-        match *self {
-            ToolFamily::Msvc { .. } => "-WX",
-            ToolFamily::Gnu | ToolFamily::Clang => "-Werror",
-        }
-    }
-
-    fn verbose_stderr(&self) -> bool {
-        *self == ToolFamily::Clang
-    }
-}
-
 /// Represents an object.
 ///
 /// This is a source file -> object file pair.
@@ -290,7 +354,7 @@ struct Object {
 impl Object {
     /// Create a new source file -> object file pair.
     fn new(src: PathBuf, dst: PathBuf) -> Object {
-        Object { src: src, dst: dst }
+        Object { src, dst }
     }
 }
 
@@ -330,7 +394,7 @@ impl Build {
             compiler: None,
             archiver: None,
             ranlib: None,
-            cargo_metadata: true,
+            cargo_output: CargoOutput::new(),
             link_lib_modifiers: Vec::new(),
             pic: None,
             use_plt: None,
@@ -340,6 +404,7 @@ impl Build {
             warnings_into_errors: false,
             env_cache: Arc::new(Mutex::new(HashMap::new())),
             apple_sdk_root_cache: Arc::new(Mutex::new(HashMap::new())),
+            apple_versions_cache: Arc::new(Mutex::new(HashMap::new())),
             emit_rerun_if_env_changed: true,
         }
     }
@@ -527,6 +592,7 @@ impl Build {
         let host = self.get_host()?;
         let mut cfg = Build::new();
         cfg.flag(flag)
+            .cargo_metadata(self.cargo_output.metadata)
             .target(&target)
             .opt_level(0)
             .host(&host)
@@ -693,7 +759,7 @@ impl Build {
     /// `true`.
     ///
     /// The name of the C++ standard library to link is decided by:
-    /// 1. If [cpp_link_stdlib](Build::cpp_link_stdlib) is set, use its value.
+    /// 1. If [`cpp_link_stdlib`](Build::cpp_link_stdlib) is set, use its value.
     /// 2. Else if the `CXXSTDLIB` environment variable is set, use its value.
     /// 3. Else the default is `libc++` for OS X and BSDs, `libc++_shared` for Android,
     /// `None` for MSVC and `libstdc++` for anything else.
@@ -708,7 +774,7 @@ impl Build {
     /// the most common compiler flags, e.g. `-std=c++17`, some project-specific
     /// flags might have to be prefixed with "-Xcompiler" flag, for example as
     /// `.flag("-Xcompiler").flag("-fpermissive")`. See the documentation for
-    /// `nvcc`, the CUDA compiler driver, at https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/
+    /// `nvcc`, the CUDA compiler driver, at <https://docs.nvidia.com/cuda/cuda-compiler-driver-nvcc/>
     /// for more information.
     ///
     /// If enabled, this also implicitly enables C++ support.
@@ -1037,14 +1103,24 @@ impl Build {
     ///  - If `emit_rerun_if_env_changed` is not `false`, `rerun-if-env-changed=`*env*
     ///
     pub fn cargo_metadata(&mut self, cargo_metadata: bool) -> &mut Build {
-        self.cargo_metadata = cargo_metadata;
+        self.cargo_output.metadata = cargo_metadata;
+        self
+    }
+
+    /// Define whether compile warnings should be emitted for cargo. Defaults to
+    /// `true`.
+    ///
+    /// If disabled, compiler messages will not be printed.
+    /// Issues unrelated to the compilation will always produce cargo warnings regardless of this setting.
+    pub fn cargo_warnings(&mut self, cargo_warnings: bool) -> &mut Build {
+        self.cargo_output.warnings = cargo_warnings;
         self
     }
 
     /// Adds a native library modifier that will be added to the
     /// `rustc-link-lib=static:MODIFIERS=LIBRARY_NAME` metadata line
     /// emitted for cargo if `cargo_metadata` is enabled.
-    /// See https://doc.rust-lang.org/rustc/command-line-arguments.html#-l-link-the-generated-crate-to-a-native-library
+    /// See <https://doc.rust-lang.org/rustc/command-line-arguments.html#-l-link-the-generated-crate-to-a-native-library>
     /// for the list of modifiers accepted by rustc.
     pub fn link_lib_modifier(&mut self, link_lib_modifier: &str) -> &mut Build {
         self.link_lib_modifiers.push(link_lib_modifier.into());
@@ -1106,7 +1182,7 @@ impl Build {
 
     /// Run the compiler, generating the file `output`
     ///
-    /// This will return a result instead of panicing; see compile() for the complete description.
+    /// This will return a result instead of panicking; see compile() for the complete description.
     pub fn try_compile(&self, output: &str) -> Result<(), Error> {
         let mut output_components = Path::new(output).components();
         match (output_components.next(), output_components.next()) {
@@ -1124,66 +1200,24 @@ impl Build {
         } else {
             let mut gnu = String::with_capacity(5 + output.len());
             gnu.push_str("lib");
-            gnu.push_str(&output);
+            gnu.push_str(output);
             gnu.push_str(".a");
             (output, gnu)
         };
         let dst = self.get_out_dir()?;
 
-        let mut objects = Vec::new();
-        for file in self.files.iter() {
-            let obj = if file.has_root() || file.components().any(|x| x == Component::ParentDir) {
-                // If `file` is an absolute path or might not be usable directly as a suffix due to
-                // using "..", use the `basename` prefixed with the `dirname`'s hash to ensure name
-                // uniqueness.
-                let basename = file
-                    .file_name()
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "file_name() failure"))?
-                    .to_string_lossy();
-                let dirname = file
-                    .parent()
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "parent() failure"))?
-                    .to_string_lossy();
-                let mut hasher = hash_map::DefaultHasher::new();
-                hasher.write(dirname.to_string().as_bytes());
-                dst.join(format!("{:016x}-{}", hasher.finish(), basename))
-                    .with_extension("o")
-            } else {
-                dst.join(file).with_extension("o")
-            };
-            let obj = if !obj.starts_with(&dst) {
-                dst.join(obj.file_name().ok_or_else(|| {
-                    Error::new(ErrorKind::IOError, "Getting object file details failed.")
-                })?)
-            } else {
-                obj
-            };
+        let objects = objects_from_files(&self.files, &dst)?;
 
-            match obj.parent() {
-                Some(s) => fs::create_dir_all(s)?,
-                None => {
-                    return Err(Error::new(
-                        ErrorKind::IOError,
-                        "Getting object file details failed.",
-                    ));
-                }
-            };
-
-            objects.push(Object::new(file.to_path_buf(), obj));
-        }
-
-        let print = PrintThread::new()?;
-
-        self.compile_objects(&objects, &print)?;
-        self.assemble(lib_name, &dst.join(gnu_lib_name), &objects, &print)?;
+        self.compile_objects(&objects)?;
+        self.assemble(lib_name, &dst.join(gnu_lib_name), &objects)?;
 
         if self.get_target()?.contains("msvc") {
             let compiler = self.get_base_compiler()?;
             let atlmfc_lib = compiler
                 .env()
                 .iter()
-                .find(|&&(ref var, _)| var.as_os_str() == OsStr::new("LIB"))
-                .and_then(|&(_, ref lib_paths)| {
+                .find(|&(var, _)| var.as_os_str() == OsStr::new("LIB"))
+                .and_then(|(_, lib_paths)| {
                     env::split_paths(lib_paths).find(|path| {
                         let sub = Path::new("atlmfc/lib");
                         path.ends_with(sub) || path.parent().map_or(false, |p| p.ends_with(sub))
@@ -1191,7 +1225,7 @@ impl Build {
                 });
 
             if let Some(atlmfc_lib) = atlmfc_lib {
-                self.print(&format_args!(
+                self.cargo_output.print_metadata(&format_args!(
                     "cargo:rustc-link-search=native={}",
                     atlmfc_lib.display()
                 ));
@@ -1199,15 +1233,16 @@ impl Build {
         }
 
         if self.link_lib_modifiers.is_empty() {
-            self.print(&format_args!("cargo:rustc-link-lib=static={}", lib_name));
+            self.cargo_output
+                .print_metadata(&format_args!("cargo:rustc-link-lib=static={}", lib_name));
         } else {
             let m = self.link_lib_modifiers.join(",");
-            self.print(&format_args!(
+            self.cargo_output.print_metadata(&format_args!(
                 "cargo:rustc-link-lib=static:{}={}",
                 m, lib_name
             ));
         }
-        self.print(&format_args!(
+        self.cargo_output.print_metadata(&format_args!(
             "cargo:rustc-link-search=native={}",
             dst.display()
         ));
@@ -1215,7 +1250,8 @@ impl Build {
         // Add specific C++ libraries, if enabled.
         if self.cpp {
             if let Some(stdlib) = self.get_cpp_link_stdlib()? {
-                self.print(&format_args!("cargo:rustc-link-lib={}", stdlib));
+                self.cargo_output
+                    .print_metadata(&format_args!("cargo:rustc-link-lib={}", stdlib));
             }
         }
 
@@ -1253,10 +1289,10 @@ impl Build {
                     }
                 }
                 if libtst && libdir.is_dir() {
-                    println!(
+                    self.cargo_output.print_metadata(&format_args!(
                         "cargo:rustc-link-search=native={}",
                         libdir.to_str().unwrap()
-                    );
+                    ));
                 }
 
                 // And now the -l flag.
@@ -1265,7 +1301,8 @@ impl Build {
                     "static" => "cudart_static",
                     bad => panic!("unsupported cudart option: {}", bad),
                 };
-                println!("cargo:rustc-link-lib={}", lib);
+                self.cargo_output
+                    .print_metadata(&format_args!("cargo:rustc-link-lib={}", lib));
             }
         }
 
@@ -1315,23 +1352,48 @@ impl Build {
         }
     }
 
+    /// Run the compiler, generating intermediate files, but without linking
+    /// them into an archive file.
+    ///
+    /// This will return a list of compiled object files, in the same order
+    /// as they were passed in as `file`/`files` methods.
+    pub fn compile_intermediates(&self) -> Vec<PathBuf> {
+        match self.try_compile_intermediates() {
+            Ok(v) => v,
+            Err(e) => fail(&e.message),
+        }
+    }
+
+    /// Run the compiler, generating intermediate files, but without linking
+    /// them into an archive file.
+    ///
+    /// This will return a result instead of panicking; see `compile_intermediates()` for the complete description.
+    pub fn try_compile_intermediates(&self) -> Result<Vec<PathBuf>, Error> {
+        let dst = self.get_out_dir()?;
+        let objects = objects_from_files(&self.files, &dst)?;
+
+        self.compile_objects(&objects)?;
+
+        Ok(objects.into_iter().map(|v| v.dst).collect())
+    }
+
     #[cfg(feature = "parallel")]
-    fn compile_objects(&self, objs: &[Object], print: &PrintThread) -> Result<(), Error> {
+    fn compile_objects(&self, objs: &[Object]) -> Result<(), Error> {
         use std::cell::Cell;
 
-        use async_executor::{block_on, YieldOnce};
+        use parallel::async_executor::{block_on, YieldOnce};
 
         if objs.len() <= 1 {
             for obj in objs {
                 let (mut cmd, name) = self.create_compile_object_cmd(obj)?;
-                run(&mut cmd, &name, print)?;
+                run(&mut cmd, &name, &self.cargo_output)?;
             }
 
             return Ok(());
         }
 
         // Limit our parallelism globally with a jobserver.
-        let tokens = crate::job_token::JobTokenServer::new();
+        let tokens = parallel::job_token::JobTokenServer::new();
 
         // When compiling objects in parallel we do a few dirty tricks to speed
         // things up:
@@ -1356,7 +1418,7 @@ impl Build {
             Command,
             String,
             KillOnDrop,
-            crate::job_token::JobToken,
+            parallel::job_token::JobToken,
         )>::new());
         let is_disconnected = Cell::new(false);
         let has_made_progress = Cell::new(false);
@@ -1378,27 +1440,38 @@ impl Build {
 
                 cell_update(&pendings, |mut pendings| {
                     // Try waiting on them.
-                    retain_unordered_mut(&mut pendings, |(cmd, program, child, _token)| {
-                        match try_wait_on_child(cmd, program, &mut child.0, &mut stdout) {
-                            Ok(Some(())) => {
-                                // Task done, remove the entry
-                                has_made_progress.set(true);
-                                false
-                            }
-                            Ok(None) => true, // Task still not finished, keep the entry
-                            Err(err) => {
-                                // Task fail, remove the entry.
-                                // Since we can only return one error, log the error to make
-                                // sure users always see all the compilation failures.
-                                has_made_progress.set(true);
+                    parallel::retain_unordered_mut(
+                        &mut pendings,
+                        |(cmd, program, child, _token)| {
+                            match try_wait_on_child(
+                                cmd,
+                                program,
+                                &mut child.0,
+                                &mut stdout,
+                                &mut child.1,
+                            ) {
+                                Ok(Some(())) => {
+                                    // Task done, remove the entry
+                                    has_made_progress.set(true);
+                                    false
+                                }
+                                Ok(None) => true, // Task still not finished, keep the entry
+                                Err(err) => {
+                                    // Task fail, remove the entry.
+                                    // Since we can only return one error, log the error to make
+                                    // sure users always see all the compilation failures.
+                                    has_made_progress.set(true);
 
-                                let _ = writeln!(stdout, "cargo:warning={}", err);
-                                error = Some(err);
+                                    if self.cargo_output.warnings {
+                                        let _ = writeln!(stdout, "cargo:warning={}", err);
+                                    }
+                                    error = Some(err);
 
-                                false
+                                    false
+                                }
                             }
-                        }
-                    });
+                        },
+                    );
                     pendings_is_empty = pendings.is_empty();
                     pendings
                 });
@@ -1424,10 +1497,12 @@ impl Build {
                         YieldOnce::default().await
                     }
                 };
-                let child = spawn(&mut cmd, &program, print.pipe_writer_cloned()?.unwrap())?;
+                let mut child = spawn(&mut cmd, &program, &self.cargo_output)?;
+                let mut stderr_forwarder = StderrForwarder::new(&mut child);
+                stderr_forwarder.set_non_blocking()?;
 
                 cell_update(&pendings, |mut pendings| {
-                    pendings.push((cmd, program, KillOnDrop(child), token));
+                    pendings.push((cmd, program, KillOnDrop(child, stderr_forwarder), token));
                     pendings
                 });
 
@@ -1440,7 +1515,7 @@ impl Build {
 
         return block_on(wait_future, spawn_future, &has_made_progress);
 
-        struct KillOnDrop(Child);
+        struct KillOnDrop(Child, StderrForwarder);
 
         impl Drop for KillOnDrop {
             fn drop(&mut self) {
@@ -1462,10 +1537,10 @@ impl Build {
     }
 
     #[cfg(not(feature = "parallel"))]
-    fn compile_objects(&self, objs: &[Object], print: &PrintThread) -> Result<(), Error> {
+    fn compile_objects(&self, objs: &[Object]) -> Result<(), Error> {
         for obj in objs {
             let (mut cmd, name) = self.create_compile_object_cmd(obj)?;
-            run(&mut cmd, &name, print)?;
+            run(&mut cmd, &name, &self.cargo_output)?;
         }
 
         Ok(())
@@ -1485,7 +1560,7 @@ impl Build {
             self.msvc_macro_assembler()?
         } else {
             let mut cmd = compiler.to_command();
-            for &(ref a, ref b) in self.env.iter() {
+            for (a, b) in self.env.iter() {
                 cmd.env(a, b);
             }
             (
@@ -1527,11 +1602,11 @@ impl Build {
         Ok((cmd, name))
     }
 
-    /// This will return a result instead of panicing; see expand() for the complete description.
+    /// This will return a result instead of panicking; see expand() for the complete description.
     pub fn try_expand(&self) -> Result<Vec<u8>, Error> {
         let compiler = self.try_get_compiler()?;
         let mut cmd = compiler.to_command();
-        for &(ref a, ref b) in self.env.iter() {
+        for (a, b) in self.env.iter() {
             cmd.env(a, b);
         }
         cmd.arg("-E");
@@ -1540,6 +1615,21 @@ impl Build {
             self.files.len() <= 1,
             "Expand may only be called for a single file"
         );
+
+        let is_asm = self
+            .files
+            .iter()
+            .map(std::ops::Deref::deref)
+            .find_map(AsmFileExt::from_path)
+            .is_some();
+
+        if compiler.family == (ToolFamily::Msvc { clang_cl: true }) && !is_asm {
+            // #513: For `clang-cl`, separate flags/options from the input file.
+            // When cross-compiling macOS -> Windows, this avoids interpreting
+            // common `/Users/...` paths as the `/U` flag and triggering
+            // `-Wslash-u-filename` warning.
+            cmd.arg("--");
+        }
 
         cmd.args(self.files.iter().map(std::ops::Deref::deref));
 
@@ -1550,7 +1640,7 @@ impl Build {
             .to_string_lossy()
             .into_owned();
 
-        Ok(run_output(&mut cmd, &name)?)
+        Ok(run_output(&mut cmd, &name, &self.cargo_output)?)
     }
 
     /// Run the compiler, returning the macro-expanded version of the input files.
@@ -1599,7 +1689,8 @@ impl Build {
 
     /// Get the compiler that's in use for this configuration.
     ///
-    /// This will return a result instead of panicing; see get_compiler() for the complete description.
+    /// This will return a result instead of panicking; see
+    /// [`get_compiler()`](Self::get_compiler) for the complete description.
     pub fn try_get_compiler(&self) -> Result<Tool, Error> {
         let opt_level = self.get_opt_level()?;
         let target = self.get_target()?;
@@ -1631,7 +1722,7 @@ impl Build {
 
         for directory in self.include_directories.iter() {
             cmd.args.push("-I".into());
-            cmd.args.push((**directory).into());
+            cmd.args.push(directory.as_os_str().into());
         }
 
         // If warnings and/or extra_warnings haven't been explicitly set,
@@ -1639,18 +1730,12 @@ impl Build {
         // CFLAGS/CXXFLAGS, since those variables presumably already contain
         // the desired set of warnings flags.
 
-        if self
-            .warnings
-            .unwrap_or(if self.has_flags() { false } else { true })
-        {
+        if self.warnings.unwrap_or(!self.has_flags()) {
             let wflags = cmd.family.warnings_flags().into();
             cmd.push_cc_arg(wflags);
         }
 
-        if self
-            .extra_warnings
-            .unwrap_or(if self.has_flags() { false } else { true })
-        {
+        if self.extra_warnings.unwrap_or(!self.has_flags()) {
             if let Some(wflags) = cmd.family.extra_warnings_flags() {
                 cmd.push_cc_arg(wflags.into());
             }
@@ -1666,7 +1751,7 @@ impl Build {
             }
         }
 
-        for &(ref key, ref value) in self.definitions.iter() {
+        for (key, value) in self.definitions.iter() {
             if let Some(ref value) = *value {
                 cmd.args.push(format!("-D{}={}", key, value).into());
             } else {
@@ -1811,8 +1896,10 @@ impl Build {
                         if let Some(arch) =
                             map_darwin_target_from_rust_to_compiler_architecture(target)
                         {
+                            let sdk_details =
+                                apple_os_sdk_parts(AppleOs::Ios, &AppleArchSpec::Simulator(""));
                             let deployment_target =
-                                self.apple_deployment_version(AppleOs::Ios, target, None);
+                                self.apple_deployment_version(AppleOs::Ios, None, &sdk_details.sdk);
                             cmd.args.push(
                                 format!(
                                     "--target={}-apple-ios{}-simulator",
@@ -1825,8 +1912,13 @@ impl Build {
                         if let Some(arch) =
                             map_darwin_target_from_rust_to_compiler_architecture(target)
                         {
-                            let deployment_target =
-                                self.apple_deployment_version(AppleOs::WatchOs, target, None);
+                            let sdk_details =
+                                apple_os_sdk_parts(AppleOs::WatchOs, &AppleArchSpec::Simulator(""));
+                            let deployment_target = self.apple_deployment_version(
+                                AppleOs::WatchOs,
+                                None,
+                                &sdk_details.sdk,
+                            );
                             cmd.args.push(
                                 format!(
                                     "--target={}-apple-watchos{}-simulator",
@@ -1839,8 +1931,13 @@ impl Build {
                         if let Some(arch) =
                             map_darwin_target_from_rust_to_compiler_architecture(target)
                         {
-                            let deployment_target =
-                                self.apple_deployment_version(AppleOs::TvOs, target, None);
+                            let sdk_details =
+                                apple_os_sdk_parts(AppleOs::TvOs, &AppleArchSpec::Simulator(""));
+                            let deployment_target = self.apple_deployment_version(
+                                AppleOs::TvOs,
+                                None,
+                                &sdk_details.sdk,
+                            );
                             cmd.args.push(
                                 format!(
                                     "--target={}-apple-tvos{}-simulator",
@@ -1853,8 +1950,13 @@ impl Build {
                         if let Some(arch) =
                             map_darwin_target_from_rust_to_compiler_architecture(target)
                         {
-                            let deployment_target =
-                                self.apple_deployment_version(AppleOs::TvOs, target, None);
+                            let sdk_details =
+                                apple_os_sdk_parts(AppleOs::TvOs, &AppleArchSpec::Device(""));
+                            let deployment_target = self.apple_deployment_version(
+                                AppleOs::TvOs,
+                                None,
+                                &sdk_details.sdk,
+                            );
                             cmd.args.push(
                                 format!("--target={}-apple-tvos{}", arch, deployment_target).into(),
                             );
@@ -1947,6 +2049,8 @@ impl Build {
                 } else {
                     if target.contains("i586") {
                         cmd.push_cc_arg("-arch:IA32".into());
+                    } else if target.contains("arm64ec") {
+                        cmd.push_cc_arg("-arm64EC".into());
                     }
                 }
 
@@ -2133,29 +2237,29 @@ impl Build {
                     let mut parts = target.split('-');
                     if let Some(arch) = parts.next() {
                         let arch = &arch[5..];
-                        if target.contains("linux") && arch.starts_with("64") {
-                            cmd.args.push(("-march=rv64gc").into());
-                            cmd.args.push("-mabi=lp64d".into());
-                        } else if target.contains("freebsd") && arch.starts_with("64") {
-                            cmd.args.push(("-march=rv64gc").into());
-                            cmd.args.push("-mabi=lp64d".into());
-                        } else if target.contains("netbsd") && arch.starts_with("64") {
-                            cmd.args.push(("-march=rv64gc").into());
-                            cmd.args.push("-mabi=lp64d".into());
-                        } else if target.contains("openbsd") && arch.starts_with("64") {
-                            cmd.args.push(("-march=rv64gc").into());
-                            cmd.args.push("-mabi=lp64d".into());
-                        } else if target.contains("linux") && arch.starts_with("32") {
-                            cmd.args.push(("-march=rv32gc").into());
-                            cmd.args.push("-mabi=ilp32d".into());
-                        } else if arch.starts_with("64") {
-                            cmd.args.push(("-march=rv".to_owned() + arch).into());
-                            cmd.args.push("-mabi=lp64".into());
+                        if arch.starts_with("64") {
+                            if target.contains("linux")
+                                | target.contains("freebsd")
+                                | target.contains("netbsd")
+                                | target.contains("linux")
+                            {
+                                cmd.args.push(("-march=rv64gc").into());
+                                cmd.args.push("-mabi=lp64d".into());
+                            } else {
+                                cmd.args.push(("-march=rv".to_owned() + arch).into());
+                                cmd.args.push("-mabi=lp64".into());
+                            }
+                        } else if arch.starts_with("32") {
+                            if target.contains("linux") {
+                                cmd.args.push(("-march=rv32gc").into());
+                                cmd.args.push("-mabi=ilp32d".into());
+                            } else {
+                                cmd.args.push(("-march=rv".to_owned() + arch).into());
+                                cmd.args.push("-mabi=ilp32".into());
+                            }
                         } else {
-                            cmd.args.push(("-march=rv".to_owned() + arch).into());
-                            cmd.args.push("-mabi=ilp32".into());
+                            cmd.args.push("-mcmodel=medany".into());
                         }
-                        cmd.args.push("-mcmodel=medany".into());
                     }
                 }
             }
@@ -2179,11 +2283,7 @@ impl Build {
                     cmd.push_cc_arg(format!("-stdlib=lib{}", stdlib).into());
                 }
                 _ => {
-                    println!(
-                        "cargo:warning=cpp_set_stdlib is specified, but the {:?} compiler \
-                         does not support this option, ignored",
-                        cmd.family
-                    );
+                    self.cargo_output.print_warning(&format_args!("cpp_set_stdlib is specified, but the {:?} compiler does not support this option, ignored", cmd.family));
                 }
             }
         }
@@ -2222,7 +2322,7 @@ impl Build {
                 cmd.arg("-g");
             }
 
-            for &(ref key, ref value) in self.definitions.iter() {
+            for (key, value) in self.definitions.iter() {
                 cmd.arg("-PreDefine");
                 if let Some(ref value) = *value {
                     if let Ok(i) = value.parse::<i32>() {
@@ -2241,7 +2341,7 @@ impl Build {
                 cmd.arg("-Zi");
             }
 
-            for &(ref key, ref value) in self.definitions.iter() {
+            for (key, value) in self.definitions.iter() {
                 if let Some(ref value) = *value {
                     cmd.arg(&format!("-D{}={}", key, value));
                 } else {
@@ -2257,13 +2357,7 @@ impl Build {
         Ok((cmd, tool.to_string()))
     }
 
-    fn assemble(
-        &self,
-        lib_name: &str,
-        dst: &Path,
-        objs: &[Object],
-        print: &PrintThread,
-    ) -> Result<(), Error> {
+    fn assemble(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
         // Delete the destination if it exists as we want to
         // create on the first iteration instead of appending.
         let _ = fs::remove_file(dst);
@@ -2277,7 +2371,7 @@ impl Build {
             .chain(self.objects.iter().map(std::ops::Deref::deref))
             .collect();
         for chunk in objs.chunks(100) {
-            self.assemble_progressive(dst, chunk, print)?;
+            self.assemble_progressive(dst, chunk)?;
         }
 
         if self.cuda && self.cuda_file_count() > 0 {
@@ -2288,8 +2382,8 @@ impl Build {
             let dlink = out_dir.join(lib_name.to_owned() + "_dlink.o");
             let mut nvcc = self.get_compiler().to_command();
             nvcc.arg("--device-link").arg("-o").arg(&dlink).arg(dst);
-            run(&mut nvcc, "nvcc", print)?;
-            self.assemble_progressive(dst, &[dlink.as_path()], print)?;
+            run(&mut nvcc, "nvcc", &self.cargo_output)?;
+            self.assemble_progressive(dst, &[dlink.as_path()])?;
         }
 
         let target = self.get_target()?;
@@ -2300,9 +2394,9 @@ impl Build {
 
             let lib_dst = dst.with_file_name(format!("{}.lib", lib_name));
             let _ = fs::remove_file(&lib_dst);
-            match fs::hard_link(&dst, &lib_dst).or_else(|_| {
+            match fs::hard_link(dst, &lib_dst).or_else(|_| {
                 // if hard-link fails, just copy (ignoring the number of bytes written)
-                fs::copy(&dst, &lib_dst).map(|_| ())
+                fs::copy(dst, &lib_dst).map(|_| ())
             }) {
                 Ok(_) => (),
                 Err(_) => {
@@ -2321,18 +2415,13 @@ impl Build {
             // NOTE: We add `s` even if flags were passed using $ARFLAGS/ar_flag, because `s`
             // here represents a _mode_, not an arbitrary flag. Further discussion of this choice
             // can be seen in https://github.com/rust-lang/cc-rs/pull/763.
-            run(ar.arg("s").arg(dst), &cmd, print)?;
+            run(ar.arg("s").arg(dst), &cmd, &self.cargo_output)?;
         }
 
         Ok(())
     }
 
-    fn assemble_progressive(
-        &self,
-        dst: &Path,
-        objs: &[&Path],
-        print: &PrintThread,
-    ) -> Result<(), Error> {
+    fn assemble_progressive(&self, dst: &Path, objs: &[&Path]) -> Result<(), Error> {
         let target = self.get_target()?;
 
         if target.contains("msvc") {
@@ -2353,7 +2442,7 @@ impl Build {
                 cmd.arg(dst);
             }
             cmd.args(objs);
-            run(&mut cmd, &program, print)?;
+            run(&mut cmd, &program, &self.cargo_output)?;
         } else {
             let (mut ar, cmd, _any_flags) = self.get_ar()?;
 
@@ -2384,19 +2473,13 @@ impl Build {
             // NOTE: We add cq here regardless of whether $ARFLAGS/ar_flag have been used because
             // it dictates the _mode_ ar runs in, which the setter of $ARFLAGS/ar_flag can't
             // dictate. See https://github.com/rust-lang/cc-rs/pull/763 for further discussion.
-            run(ar.arg("cq").arg(dst).args(objs), &cmd, print)?;
+            run(ar.arg("cq").arg(dst).args(objs), &cmd, &self.cargo_output)?;
         }
 
         Ok(())
     }
 
     fn apple_flags(&self, cmd: &mut Tool) -> Result<(), Error> {
-        enum ArchSpec {
-            Device(&'static str),
-            Simulator(&'static str),
-            Catalyst(&'static str),
-        }
-
         let target = self.get_target()?;
         let os = if target.contains("-darwin") {
             AppleOs::MacOs
@@ -2431,8 +2514,8 @@ impl Build {
 
         let arch = if is_mac {
             match arch_str {
-                "i686" => ArchSpec::Device("-m32"),
-                "x86_64" | "x86_64h" | "aarch64" => ArchSpec::Device("-m64"),
+                "i686" => AppleArchSpec::Device("-m32"),
+                "x86_64" | "x86_64h" | "aarch64" => AppleArchSpec::Device("-m64"),
                 _ => {
                     return Err(Error::new(
                         ErrorKind::ArchitectureInvalid,
@@ -2442,9 +2525,9 @@ impl Build {
             }
         } else if is_catalyst {
             match arch_str {
-                "arm64e" => ArchSpec::Catalyst("arm64e"),
-                "arm64" | "aarch64" => ArchSpec::Catalyst("arm64"),
-                "x86_64" | "x86_64h" => ArchSpec::Catalyst("-m64"),
+                "arm64e" => AppleArchSpec::Catalyst("arm64e"),
+                "arm64" | "aarch64" => AppleArchSpec::Catalyst("arm64"),
+                "x86_64" | "x86_64h" => AppleArchSpec::Catalyst("-m64"),
                 _ => {
                     return Err(Error::new(
                         ErrorKind::ArchitectureInvalid,
@@ -2454,8 +2537,8 @@ impl Build {
             }
         } else if is_arm_sim {
             match arch_str {
-                "arm64" | "aarch64" => ArchSpec::Simulator("arm64"),
-                "x86_64" | "x86_64h" => ArchSpec::Simulator("-m64"),
+                "arm64" | "aarch64" => AppleArchSpec::Simulator("arm64"),
+                "x86_64" | "x86_64h" => AppleArchSpec::Simulator("-m64"),
                 _ => {
                     return Err(Error::new(
                         ErrorKind::ArchitectureInvalid,
@@ -2465,14 +2548,14 @@ impl Build {
             }
         } else {
             match arch_str {
-                "arm" | "armv7" | "thumbv7" => ArchSpec::Device("armv7"),
-                "armv7k" => ArchSpec::Device("armv7k"),
-                "armv7s" | "thumbv7s" => ArchSpec::Device("armv7s"),
-                "arm64e" => ArchSpec::Device("arm64e"),
-                "arm64" | "aarch64" => ArchSpec::Device("arm64"),
-                "arm64_32" => ArchSpec::Device("arm64_32"),
-                "i386" | "i686" => ArchSpec::Simulator("-m32"),
-                "x86_64" | "x86_64h" => ArchSpec::Simulator("-m64"),
+                "arm" | "armv7" | "thumbv7" => AppleArchSpec::Device("armv7"),
+                "armv7k" => AppleArchSpec::Device("armv7k"),
+                "armv7s" | "thumbv7s" => AppleArchSpec::Device("armv7s"),
+                "arm64e" => AppleArchSpec::Device("arm64e"),
+                "arm64" | "aarch64" => AppleArchSpec::Device("arm64"),
+                "arm64_32" => AppleArchSpec::Device("arm64_32"),
+                "i386" | "i686" => AppleArchSpec::Simulator("-m32"),
+                "x86_64" | "x86_64h" => AppleArchSpec::Simulator("-m64"),
                 _ => {
                     return Err(Error::new(
                         ErrorKind::ArchitectureInvalid,
@@ -2482,28 +2565,22 @@ impl Build {
             }
         };
 
-        let min_version = self.apple_deployment_version(os, &target, Some(arch_str));
-        let (sdk_prefix, sim_prefix) = match os {
-            AppleOs::MacOs => ("macosx", ""),
-            AppleOs::Ios => ("iphone", "ios-"),
-            AppleOs::WatchOs => ("watch", "watch"),
-            AppleOs::TvOs => ("appletv", "appletv"),
-        };
+        let sdk_details = apple_os_sdk_parts(os, &arch);
+        let min_version = self.apple_deployment_version(os, Some(arch_str), &sdk_details.sdk);
 
-        let sdk = match arch {
-            ArchSpec::Device(_) if is_mac => {
+        match arch {
+            AppleArchSpec::Device(_) if is_mac => {
                 cmd.args
                     .push(format!("-mmacosx-version-min={}", min_version).into());
-                "macosx".to_owned()
             }
-            ArchSpec::Device(arch) => {
+            AppleArchSpec::Device(arch) => {
                 cmd.args.push("-arch".into());
                 cmd.args.push(arch.into());
-                cmd.args
-                    .push(format!("-m{}os-version-min={}", sdk_prefix, min_version).into());
-                format!("{}os", sdk_prefix)
+                cmd.args.push(
+                    format!("-m{}os-version-min={}", sdk_details.sdk_prefix, min_version).into(),
+                );
             }
-            ArchSpec::Simulator(arch) => {
+            AppleArchSpec::Simulator(arch) => {
                 if arch.starts_with('-') {
                     // -m32 or -m64
                     cmd.args.push(arch.into());
@@ -2511,20 +2588,27 @@ impl Build {
                     cmd.args.push("-arch".into());
                     cmd.args.push(arch.into());
                 }
-                cmd.args
-                    .push(format!("-m{}simulator-version-min={}", sim_prefix, min_version).into());
-                format!("{}simulator", sdk_prefix)
+                cmd.args.push(
+                    format!(
+                        "-m{}simulator-version-min={}",
+                        sdk_details.sim_prefix, min_version
+                    )
+                    .into(),
+                );
             }
-            ArchSpec::Catalyst(_) => "macosx".to_owned(),
+            AppleArchSpec::Catalyst(_) => {}
         };
 
         // AppleClang sometimes requires sysroot even for darwin
         if cmd.is_xctoolchain_clang() || !target.ends_with("-darwin") {
-            self.print(&format_args!("Detecting {:?} SDK path for {}", os, sdk));
+            self.cargo_output.print_metadata(&format_args!(
+                "Detecting {:?} SDK path for {}",
+                os, sdk_details.sdk
+            ));
             let sdk_path = if let Some(sdkroot) = env::var_os("SDKROOT") {
                 sdkroot
             } else {
-                self.apple_sdk_root(sdk.as_str())?
+                self.apple_sdk_root(&sdk_details.sdk)?
             };
 
             cmd.args.push("-isysroot".into());
@@ -2536,7 +2620,7 @@ impl Build {
 
     fn cmd<P: AsRef<OsStr>>(&self, prog: P) -> Command {
         let mut cmd = Command::new(prog);
-        for &(ref a, ref b) in self.env.iter() {
+        for (a, b) in self.env.iter() {
             cmd.env(a, b);
         }
         cmd
@@ -2544,7 +2628,7 @@ impl Build {
 
     fn get_base_compiler(&self) -> Result<Tool, Error> {
         if let Some(c) = &self.compiler {
-            return Ok(Tool::new((**c).to_owned()));
+            return Ok(Tool::new((**c).to_owned(), &self.cargo_output));
         }
         let host = self.get_host()?;
         let target = self.get_target()?;
@@ -2565,7 +2649,7 @@ impl Build {
             traditional
         };
 
-        let cl_exe = windows_registry::find_tool(&target, "cl.exe");
+        let cl_exe = windows_registry::find_tool(target, "cl.exe");
 
         let tool_opt: Option<Tool> = self
             .env_tool(env)
@@ -2580,7 +2664,7 @@ impl Build {
                 // semi-buggy build scripts which are shared in
                 // makefiles/configure scripts (where spaces are far more
                 // lenient)
-                let mut t = Tool::with_clang_driver(tool, driver_mode);
+                let mut t = Tool::with_clang_driver(tool, driver_mode, &self.cargo_output);
                 if let Some(cc_wrapper) = wrapper {
                     t.cc_wrapper_path = Some(PathBuf::from(cc_wrapper));
                 }
@@ -2594,12 +2678,12 @@ impl Build {
                     let tool = if self.cpp { "em++" } else { "emcc" };
                     // Windows uses bat file so we have to be a bit more specific
                     if cfg!(windows) {
-                        let mut t = Tool::new(PathBuf::from("cmd"));
+                        let mut t = Tool::new(PathBuf::from("cmd"), &self.cargo_output);
                         t.args.push("/c".into());
                         t.args.push(format!("{}.bat", tool).into());
                         Some(t)
                     } else {
-                        Some(Tool::new(PathBuf::from(tool)))
+                        Some(Tool::new(PathBuf::from(tool), &self.cargo_output))
                     }
                 } else {
                     None
@@ -2617,14 +2701,13 @@ impl Build {
                         let cc = if target.contains("llvm") { clang } else { gnu };
                         format!("{}.exe", cc)
                     }
-                } else if target.contains("apple-ios") {
-                    clang.to_string()
-                } else if target.contains("apple-watchos") {
-                    clang.to_string()
-                } else if target.contains("apple-tvos") {
+                } else if target.contains("apple-ios")
+                    | target.contains("apple-watchos")
+                    | target.contains("apple-tvos")
+                {
                     clang.to_string()
                 } else if target.contains("android") {
-                    autodetect_android_compiler(&target, &host, gnu, clang)
+                    autodetect_android_compiler(target, &host, gnu, clang)
                 } else if target.contains("cloudabi") {
                     format!("{}-{}", target, traditional)
                 } else if target == "wasm32-wasi"
@@ -2643,7 +2726,7 @@ impl Build {
                 } else if target.starts_with("aarch64-kmc-solid_") {
                     format!("aarch64-kmc-elf-{}", gnu)
                 } else if &*self.get_host()? != target {
-                    let prefix = self.prefix_for_target(&target);
+                    let prefix = self.prefix_for_target(target);
                     match prefix {
                         Some(prefix) => {
                             let cc = if target.contains("llvm") { clang } else { gnu };
@@ -2655,7 +2738,7 @@ impl Build {
                     default.to_string()
                 };
 
-                let mut t = Tool::new(PathBuf::from(compiler));
+                let mut t = Tool::new(PathBuf::from(compiler), &self.cargo_output);
                 if let Some(cc_wrapper) = Self::rustc_wrapper_fallback() {
                     t.cc_wrapper_path = Some(PathBuf::from(cc_wrapper));
                 }
@@ -2672,7 +2755,7 @@ impl Build {
                 Err(_) => PathBuf::from("nvcc"),
                 Ok(nvcc) => PathBuf::from(&*nvcc),
             };
-            let mut nvcc_tool = Tool::with_features(nvcc, None, self.cuda);
+            let mut nvcc_tool = Tool::with_features(nvcc, None, self.cuda, &self.cargo_output);
             nvcc_tool
                 .args
                 .push(format!("-ccbin={}", tool.path.display()).into());
@@ -2697,17 +2780,17 @@ impl Build {
         {
             if let Some(path) = tool.path.file_name() {
                 let file_name = path.to_str().unwrap().to_owned();
-                let (target, clang) = file_name.split_at(file_name.rfind("-").unwrap());
+                let (target, clang) = file_name.split_at(file_name.rfind('-').unwrap());
 
                 tool.has_internal_target_arg = true;
-                tool.path.set_file_name(clang.trim_start_matches("-"));
+                tool.path.set_file_name(clang.trim_start_matches('-'));
                 tool.path.set_extension("exe");
                 tool.args.push(format!("--target={}", target).into());
 
                 // Additionally, shell scripts for target i686-linux-android versions 16 to 24
                 // pass the `mstackrealign` option so we do that here as well.
                 if target.contains("i686-linux-android") {
-                    let (_, version) = target.split_at(target.rfind("d").unwrap() + 1);
+                    let (_, version) = target.split_at(target.rfind('d').unwrap() + 1);
                     if let Ok(version) = version.parse::<u32>() {
                         if version > 15 && version < 25 {
                             tool.args.push("-mstackrealign".into());
@@ -2732,14 +2815,15 @@ impl Build {
                 && tool.env.len() == 0
                 && target.contains("msvc")
             {
-                for &(ref k, ref v) in cl_exe.env.iter() {
+                for (k, v) in cl_exe.env.iter() {
                     tool.env.push((k.to_owned(), v.to_owned()));
                 }
             }
         }
 
         if target.contains("msvc") && tool.family == ToolFamily::Gnu {
-            println!("cargo:warning=GNU compiler is not supported for this target");
+            self.cargo_output
+                .print_warning(&"GNU compiler is not supported for this target");
         }
 
         Ok(tool)
@@ -2774,7 +2858,11 @@ impl Build {
         // interpretation at all, just pass it on through. This'll hopefully get
         // us to support spaces-in-paths.
         if Path::new(&*tool).exists() {
-            return Some((PathBuf::from(&*tool), None, Vec::new()));
+            return Some((
+                PathBuf::from(&*tool),
+                Self::rustc_wrapper_fallback(),
+                Vec::new(),
+            ));
         }
 
         // Ok now we want to handle a couple of scenarios. We'll assume from
@@ -2828,7 +2916,7 @@ impl Build {
     }
 
     /// Returns the C++ standard library:
-    /// 1. If [cpp_link_stdlib](cc::Build::cpp_link_stdlib) is set, uses its value.
+    /// 1. If [`cpp_link_stdlib`](cc::Build::cpp_link_stdlib) is set, uses its value.
     /// 2. Else if the `CXXSTDLIB` environment variable is set, uses its value.
     /// 3. Else the default is `libc++` for OS X and BSDs, `libc++_shared` for Android,
     /// `None` for MSVC and `libstdc++` for anything else.
@@ -2846,13 +2934,12 @@ impl Build {
                     let target = self.get_target()?;
                     if target.contains("msvc") {
                         Ok(None)
-                    } else if target.contains("apple") {
-                        Ok(Some("c++".to_string()))
-                    } else if target.contains("freebsd") {
-                        Ok(Some("c++".to_string()))
-                    } else if target.contains("openbsd") {
-                        Ok(Some("c++".to_string()))
-                    } else if target.contains("aix") {
+                    } else if target.contains("apple")
+                        | target.contains("freebsd")
+                        | target.contains("openbsd")
+                        | target.contains("aix")
+                        | target.contains("linux-ohos")
+                    {
                         Ok(Some("c++".to_string()))
                     } else if target.contains("android") {
                         Ok(Some("c++_shared".to_string()))
@@ -2891,8 +2978,8 @@ impl Build {
 
     /// Get the archiver that's in use for this configuration.
     ///
-    /// This will return a result instead of panicing;
-    /// see [`get_archiver()`] for the complete description.
+    /// This will return a result instead of panicking;
+    /// see [`Self::get_archiver`] for the complete description.
     pub fn try_get_archiver(&self) -> Result<Command, Error> {
         Ok(self.try_get_archiver_and_flags()?.0)
     }
@@ -2942,8 +3029,8 @@ impl Build {
 
     /// Get the ranlib that's in use for this configuration.
     ///
-    /// This will return a result instead of panicing;
-    /// see [`get_ranlib()`] for the complete description.
+    /// This will return a result instead of panicking;
+    /// see [`Self::get_ranlib`] for the complete description.
     pub fn try_get_ranlib(&self) -> Result<Command, Error> {
         let mut cmd = self.get_base_ranlib()?;
         if let Ok(flags) = self.envflags("RANLIBFLAGS") {
@@ -2986,13 +3073,13 @@ impl Build {
                     // Formally speaking one should be able to use this approach,
                     // parsing -print-search-dirs output, to cover all clang targets,
                     // including Android SDKs and other cross-compilation scenarios...
-                    // And even extend it to gcc targets by seaching for "ar" instead
+                    // And even extend it to gcc targets by searching for "ar" instead
                     // of "llvm-ar"...
                     let compiler = self.get_base_compiler().ok()?;
                     if compiler.family == ToolFamily::Clang {
                         name = format!("llvm-{}", tool);
-                        search_programs(&mut self.cmd(&compiler.path), &name)
-                            .map(|name| self.cmd(&name))
+                        search_programs(&mut self.cmd(&compiler.path), &name, &self.cargo_output)
+                            .map(|name| self.cmd(name))
                     } else {
                         None
                     }
@@ -3033,10 +3120,14 @@ impl Build {
 
                     if lib.is_empty() {
                         name = String::from("lib.exe");
-                        match windows_registry::find(&target, "lib.exe") {
+                        let mut cmd = match windows_registry::find(&target, "lib.exe") {
                             Some(t) => t,
                             None => self.cmd("lib.exe"),
+                        };
+                        if target.contains("arm64ec") {
+                            cmd.arg("/machine:arm64ec");
                         }
+                        cmd
                     } else {
                         name = lib;
                         self.cmd(&name)
@@ -3053,7 +3144,7 @@ impl Build {
                         Some(p) => {
                             // GCC uses $target-gcc-ar, whereas binutils uses $target-ar -- try both.
                             // Prefer -ar if it exists, as builds of `-gcc-ar` have been observed to be
-                            // outright broken (such as when targetting freebsd with `--disable-lto`
+                            // outright broken (such as when targeting freebsd with `--disable-lto`
                             // toolchain where the archiver attempts to load the LTO plugin anyway but
                             // fails to find one).
                             //
@@ -3150,6 +3241,7 @@ impl Build {
                 "riscv64-unknown-elf",
                 "riscv-none-embed",
             ]),
+            "riscv32imac-esp-espidf" => Some("riscv32-esp-elf"),
             "riscv32imac-unknown-none-elf" => self.find_working_gnu_prefix(&[
                 "riscv32-unknown-elf",
                 "riscv64-unknown-elf",
@@ -3332,10 +3424,12 @@ impl Build {
             return val.clone();
         }
         if self.emit_rerun_if_env_changed && !provided_by_cargo(v) {
-            self.print(&format_args!("cargo:rerun-if-env-changed={}", v));
+            self.cargo_output
+                .print_metadata(&format_args!("cargo:rerun-if-env-changed={}", v));
         }
         let r = env::var(v).ok().map(Arc::from);
-        self.print(&format_args!("{} = {:?}", v, r));
+        self.cargo_output
+            .print_metadata(&format_args!("{} = {:?}", v, r));
         cache.insert(v.to_string(), r.clone());
         r
     }
@@ -3354,7 +3448,7 @@ impl Build {
         let target = self.get_target()?;
         let host = self.get_host()?;
         let kind = if host == target { "HOST" } else { "TARGET" };
-        let target_u = target.replace("-", "_");
+        let target_u = target.replace('-', "_");
         let res = self
             .getenv(&format!("{}_{}", var_base, target))
             .or_else(|| self.getenv(&format!("{}_{}", var_base, target_u)))
@@ -3376,12 +3470,6 @@ impl Build {
             .split_ascii_whitespace()
             .map(|slice| slice.to_string())
             .collect())
-    }
-
-    fn print(&self, s: &dyn Display) {
-        if self.cargo_metadata {
-            println!("{}", s);
-        }
     }
 
     fn fix_env_for_apple_os(&self, cmd: &mut Command) -> Result<(), Error> {
@@ -3411,6 +3499,7 @@ impl Build {
                 .arg("--sdk")
                 .arg(sdk),
             "xcrun",
+            &self.cargo_output,
         )?;
 
         let sdk_path = match String::from_utf8(sdk_path) {
@@ -3427,67 +3516,125 @@ impl Build {
         Ok(ret)
     }
 
-    fn apple_deployment_version(
-        &self,
-        os: AppleOs,
-        target: &str,
-        arch_str: Option<&str>,
-    ) -> String {
-        fn rustc_provided_target(rustc: Option<&str>, target: &str) -> Option<String> {
-            let rustc = rustc?;
-            let output = Command::new(rustc)
-                .args(&["--target", target])
-                .args(&["--print", "deployment-target"])
-                .output()
-                .ok()?;
+    fn apple_deployment_version(&self, os: AppleOs, arch_str: Option<&str>, sdk: &str) -> String {
+        let default_deployment_from_sdk = || {
+            let mut cache = self
+                .apple_versions_cache
+                .lock()
+                .expect("apple_versions_cache lock failed");
 
-            if output.status.success() {
-                std::str::from_utf8(&output.stdout)
-                    .unwrap()
-                    .strip_prefix("deployment_target=")
-                    .map(|v| v.trim())
-                    .map(ToString::to_string)
-            } else {
-                // rustc is < 1.71
-                None
+            if let Some(ret) = cache.get(sdk) {
+                return Some(ret.clone());
             }
-        }
 
-        let rustc = self.getenv("RUSTC");
-        let rustc = rustc.as_deref();
-        // note the hardcoded minimums here are subject to change in a future compiler release,
-        // so the ones rustc knows about are preferred. For any compiler version that has bumped them
-        // though, `--print deployment-target` will be present and the fallbacks won't be used.
+            let version = run_output(
+                self.cmd("xcrun")
+                    .arg("--show-sdk-platform-version")
+                    .arg("--sdk")
+                    .arg(sdk),
+                "xcrun",
+                &self.cargo_output,
+            )
+            .ok()?;
+
+            let version = std::str::from_utf8(&version).ok()?.trim().to_owned();
+
+            cache.insert(sdk.into(), version.clone());
+            Some(version)
+        };
+
+        let deployment_from_env = |name: &str| {
+            // note this isn't hit in production codepaths, its mostly just for tests which don't
+            // set the real env
+            if let Some((_, v)) = self.env.iter().find(|(k, _)| &**k == OsStr::new(name)) {
+                Some(v.to_str().unwrap().to_string())
+            } else {
+                env::var(name).ok()
+            }
+        };
+
+        // Determines if the acquired deployment target is too low to support modern C++ on some Apple platform.
         //
-        // the ordering of env -> rustc -> old defaults is intentional for performance when using
-        // an explicit target
+        // A long time ago they used libstdc++, but since macOS 10.9 and iOS 7 libc++ has been the library the SDKs provide to link against.
+        // If a `cc`` config wants to use C++, we round up to these versions as the baseline.
+        let maybe_cpp_version_baseline = |deployment_target_ver: String| -> Option<String> {
+            if !self.cpp {
+                return Some(deployment_target_ver);
+            }
+
+            let mut deployment_target = deployment_target_ver
+                .split('.')
+                .map(|v| v.parse::<u32>().expect("integer version"));
+
+            match os {
+                AppleOs::MacOs => {
+                    let major = deployment_target.next().unwrap_or(0);
+                    let minor = deployment_target.next().unwrap_or(0);
+
+                    // If below 10.9, we ignore it and let the SDK's target definitions handle it.
+                    if major == 10 && minor < 9 {
+                        self.cargo_output.print_warning(&format_args!(
+                            "macOS deployment target ({}) too low, it will be increased",
+                            deployment_target_ver
+                        ));
+                        return None;
+                    }
+                }
+                AppleOs::Ios => {
+                    let major = deployment_target.next().unwrap_or(0);
+
+                    // If below 10.7, we ignore it and let the SDK's target definitions handle it.
+                    if major < 7 {
+                        self.cargo_output.print_warning(&format_args!(
+                            "iOS deployment target ({}) too low, it will be increased",
+                            deployment_target_ver
+                        ));
+                        return None;
+                    }
+                }
+                // watchOS, tvOS, and others are all new enough that libc++ is their baseline.
+                _ => {}
+            }
+
+            // If the deployment target met or exceeded the C++ baseline
+            Some(deployment_target_ver)
+        };
+
+        // The hardcoded minimums here are subject to change in a future compiler release,
+        // and only exist as last resort fallbacks. Don't consider them stable.
+        // `cc` doesn't use rustc's `--print deployment-target`` because the compiler's defaults
+        // don't align well with Apple's SDKs and other third-party libraries that require ~generally~ higher
+        // deployment targets. rustc isn't interested in those by default though so its fine to be different here.
+        //
+        // If no explicit target is passed, `cc` defaults to the current Xcode SDK's `DefaultDeploymentTarget` for better
+        // compatibility. This is also the crate's historical behavior and what has become a relied-on value.
+        //
+        // The ordering of env -> XCode SDK -> old rustc defaults is intentional for performance when using
+        // an explicit target.
         match os {
-            AppleOs::MacOs => env::var("MACOSX_DEPLOYMENT_TARGET")
-                .ok()
-                .or_else(|| rustc_provided_target(rustc, target))
+            AppleOs::MacOs => deployment_from_env("MACOSX_DEPLOYMENT_TARGET")
+                .and_then(maybe_cpp_version_baseline)
+                .or_else(default_deployment_from_sdk)
                 .unwrap_or_else(|| {
                     if arch_str == Some("aarch64") {
-                        "11.0"
+                        "11.0".into()
                     } else {
-                        if self.cpp {
-                            "10.9"
-                        } else {
-                            "10.7"
-                        }
+                        let default = "10.7";
+                        maybe_cpp_version_baseline(default.into()).unwrap_or_else(|| default.into())
                     }
-                    .into()
                 }),
-            AppleOs::Ios => env::var("IPHONEOS_DEPLOYMENT_TARGET")
-                .ok()
-                .or_else(|| rustc_provided_target(rustc, target))
+
+            AppleOs::Ios => deployment_from_env("IPHONEOS_DEPLOYMENT_TARGET")
+                .and_then(maybe_cpp_version_baseline)
+                .or_else(default_deployment_from_sdk)
                 .unwrap_or_else(|| "7.0".into()),
-            AppleOs::WatchOs => env::var("WATCHOS_DEPLOYMENT_TARGET")
-                .ok()
-                .or_else(|| rustc_provided_target(rustc, target))
+
+            AppleOs::WatchOs => deployment_from_env("WATCHOS_DEPLOYMENT_TARGET")
+                .or_else(default_deployment_from_sdk)
                 .unwrap_or_else(|| "5.0".into()),
-            AppleOs::TvOs => env::var("TVOS_DEPLOYMENT_TARGET")
-                .ok()
-                .or_else(|| rustc_provided_target(rustc, target))
+
+            AppleOs::TvOs => deployment_from_env("TVOS_DEPLOYMENT_TARGET")
+                .or_else(default_deployment_from_sdk)
                 .unwrap_or_else(|| "9.0".into()),
         }
     }
@@ -3506,422 +3653,12 @@ impl Default for Build {
     }
 }
 
-impl Tool {
-    fn new(path: PathBuf) -> Self {
-        Tool::with_features(path, None, false)
-    }
-
-    fn with_clang_driver(path: PathBuf, clang_driver: Option<&str>) -> Self {
-        Self::with_features(path, clang_driver, false)
-    }
-
-    #[cfg(windows)]
-    /// Explicitly set the `ToolFamily`, skipping name-based detection.
-    fn with_family(path: PathBuf, family: ToolFamily) -> Self {
-        Self {
-            path: path,
-            cc_wrapper_path: None,
-            cc_wrapper_args: Vec::new(),
-            args: Vec::new(),
-            env: Vec::new(),
-            family: family,
-            cuda: false,
-            removed_args: Vec::new(),
-            has_internal_target_arg: false,
-        }
-    }
-
-    fn with_features(path: PathBuf, clang_driver: Option<&str>, cuda: bool) -> Self {
-        fn detect_family(path: &Path) -> ToolFamily {
-            let mut cmd = Command::new(path);
-            cmd.arg("--version");
-
-            let stdout = match run_output(&mut cmd, &path.to_string_lossy())
-                .ok()
-                .and_then(|o| String::from_utf8(o).ok())
-            {
-                Some(s) => s,
-                None => {
-                    // --version failed. fallback to gnu
-                    println!("cargo-warning:Failed to run: {:?}", cmd);
-                    return ToolFamily::Gnu;
-                }
-            };
-            if stdout.contains("clang") {
-                ToolFamily::Clang
-            } else if stdout.contains("GCC") {
-                ToolFamily::Gnu
-            } else {
-                // --version doesn't include clang for GCC
-                println!(
-                    "cargo-warning:Compiler version doesn't include clang or GCC: {:?}",
-                    cmd
-                );
-                ToolFamily::Gnu
-            }
-        }
-
-        // Try to detect family of the tool from its name, falling back to Gnu.
-        let family = if let Some(fname) = path.file_name().and_then(|p| p.to_str()) {
-            if fname.contains("clang-cl") {
-                ToolFamily::Msvc { clang_cl: true }
-            } else if fname.ends_with("cl") || fname == "cl.exe" {
-                ToolFamily::Msvc { clang_cl: false }
-            } else if fname.contains("clang") {
-                match clang_driver {
-                    Some("cl") => ToolFamily::Msvc { clang_cl: true },
-                    _ => ToolFamily::Clang,
-                }
-            } else {
-                detect_family(&path)
-            }
-        } else {
-            detect_family(&path)
-        };
-
-        Tool {
-            path: path,
-            cc_wrapper_path: None,
-            cc_wrapper_args: Vec::new(),
-            args: Vec::new(),
-            env: Vec::new(),
-            family: family,
-            cuda: cuda,
-            removed_args: Vec::new(),
-            has_internal_target_arg: false,
-        }
-    }
-
-    /// Add an argument to be stripped from the final command arguments.
-    fn remove_arg(&mut self, flag: OsString) {
-        self.removed_args.push(flag);
-    }
-
-    /// Push an "exotic" flag to the end of the compiler's arguments list.
-    ///
-    /// Nvidia compiler accepts only the most common compiler flags like `-D`,
-    /// `-I`, `-c`, etc. Options meant specifically for the underlying
-    /// host C++ compiler have to be prefixed with '-Xcompiler`.
-    /// [Another possible future application for this function is passing
-    /// clang-specific flags to clang-cl, which otherwise accepts only
-    /// MSVC-specific options.]
-    fn push_cc_arg(&mut self, flag: OsString) {
-        if self.cuda {
-            self.args.push("-Xcompiler".into());
-        }
-        self.args.push(flag);
-    }
-
-    /// Checks if an argument or flag has already been specified or conflicts.
-    ///
-    /// Currently only checks optimization flags.
-    fn is_duplicate_opt_arg(&self, flag: &OsString) -> bool {
-        let flag = flag.to_str().unwrap();
-        let mut chars = flag.chars();
-
-        // Only duplicate check compiler flags
-        if self.is_like_msvc() {
-            if chars.next() != Some('/') {
-                return false;
-            }
-        } else if self.is_like_gnu() || self.is_like_clang() {
-            if chars.next() != Some('-') {
-                return false;
-            }
-        }
-
-        // Check for existing optimization flags (-O, /O)
-        if chars.next() == Some('O') {
-            return self
-                .args()
-                .iter()
-                .any(|ref a| a.to_str().unwrap_or("").chars().nth(1) == Some('O'));
-        }
-
-        // TODO Check for existing -m..., -m...=..., /arch:... flags
-        return false;
-    }
-
-    /// Don't push optimization arg if it conflicts with existing args.
-    fn push_opt_unless_duplicate(&mut self, flag: OsString) {
-        if self.is_duplicate_opt_arg(&flag) {
-            println!("Info: Ignoring duplicate arg {:?}", &flag);
-        } else {
-            self.push_cc_arg(flag);
-        }
-    }
-
-    /// Converts this compiler into a `Command` that's ready to be run.
-    ///
-    /// This is useful for when the compiler needs to be executed and the
-    /// command returned will already have the initial arguments and environment
-    /// variables configured.
-    pub fn to_command(&self) -> Command {
-        let mut cmd = match self.cc_wrapper_path {
-            Some(ref cc_wrapper_path) => {
-                let mut cmd = Command::new(&cc_wrapper_path);
-                cmd.arg(&self.path);
-                cmd
-            }
-            None => Command::new(&self.path),
-        };
-        cmd.args(&self.cc_wrapper_args);
-
-        let value = self
-            .args
-            .iter()
-            .filter(|a| !self.removed_args.contains(a))
-            .collect::<Vec<_>>();
-        cmd.args(&value);
-
-        for &(ref k, ref v) in self.env.iter() {
-            cmd.env(k, v);
-        }
-        cmd
-    }
-
-    /// Returns the path for this compiler.
-    ///
-    /// Note that this may not be a path to a file on the filesystem, e.g. "cc",
-    /// but rather something which will be resolved when a process is spawned.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Returns the default set of arguments to the compiler needed to produce
-    /// executables for the target this compiler generates.
-    pub fn args(&self) -> &[OsString] {
-        &self.args
-    }
-
-    /// Returns the set of environment variables needed for this compiler to
-    /// operate.
-    ///
-    /// This is typically only used for MSVC compilers currently.
-    pub fn env(&self) -> &[(OsString, OsString)] {
-        &self.env
-    }
-
-    /// Returns the compiler command in format of CC environment variable.
-    /// Or empty string if CC env was not present
-    ///
-    /// This is typically used by configure script
-    pub fn cc_env(&self) -> OsString {
-        match self.cc_wrapper_path {
-            Some(ref cc_wrapper_path) => {
-                let mut cc_env = cc_wrapper_path.as_os_str().to_owned();
-                cc_env.push(" ");
-                cc_env.push(self.path.to_path_buf().into_os_string());
-                for arg in self.cc_wrapper_args.iter() {
-                    cc_env.push(" ");
-                    cc_env.push(arg);
-                }
-                cc_env
-            }
-            None => OsString::from(""),
-        }
-    }
-
-    /// Returns the compiler flags in format of CFLAGS environment variable.
-    /// Important here - this will not be CFLAGS from env, its internal gcc's flags to use as CFLAGS
-    /// This is typically used by configure script
-    pub fn cflags_env(&self) -> OsString {
-        let mut flags = OsString::new();
-        for (i, arg) in self.args.iter().enumerate() {
-            if i > 0 {
-                flags.push(" ");
-            }
-            flags.push(arg);
-        }
-        flags
-    }
-
-    /// Whether the tool is GNU Compiler Collection-like.
-    pub fn is_like_gnu(&self) -> bool {
-        self.family == ToolFamily::Gnu
-    }
-
-    /// Whether the tool is Clang-like.
-    pub fn is_like_clang(&self) -> bool {
-        self.family == ToolFamily::Clang
-    }
-
-    /// Whether the tool is AppleClang under .xctoolchain
-    #[cfg(target_vendor = "apple")]
-    fn is_xctoolchain_clang(&self) -> bool {
-        let path = self.path.to_string_lossy();
-        path.contains(".xctoolchain/")
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    fn is_xctoolchain_clang(&self) -> bool {
-        false
-    }
-
-    /// Whether the tool is MSVC-like.
-    pub fn is_like_msvc(&self) -> bool {
-        match self.family {
-            ToolFamily::Msvc { .. } => true,
-            _ => false,
-        }
-    }
-}
-
-fn wait_on_child(cmd: &Command, program: &str, child: &mut Child) -> Result<(), Error> {
-    let status = match child.wait() {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(Error::new(
-                ErrorKind::ToolExecError,
-                format!(
-                    "Failed to wait on spawned child process, command {:?} with args {:?}: {}.",
-                    cmd, program, e
-                ),
-            ));
-        }
-    };
-    println!("{}", status);
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::new(
-            ErrorKind::ToolExecError,
-            format!(
-                "Command {:?} with args {:?} did not execute successfully (status code {}).",
-                cmd, program, status
-            ),
-        ))
-    }
-}
-
-#[cfg(feature = "parallel")]
-fn try_wait_on_child(
-    cmd: &Command,
-    program: &str,
-    child: &mut Child,
-    stdout: &mut dyn io::Write,
-) -> Result<Option<()>, Error> {
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            let _ = writeln!(stdout, "{}", status);
-
-            if status.success() {
-                Ok(Some(()))
-            } else {
-                Err(Error::new(
-                    ErrorKind::ToolExecError,
-                    format!(
-                        "Command {:?} with args {:?} did not execute successfully (status code {}).",
-                        cmd, program, status
-                    ),
-                ))
-            }
-        }
-        Ok(None) => Ok(None),
-        Err(e) => Err(Error::new(
-            ErrorKind::ToolExecError,
-            format!(
-                "Failed to wait on spawned child process, command {:?} with args {:?}: {}.",
-                cmd, program, e
-            ),
-        )),
-    }
-}
-
-fn run_inner(cmd: &mut Command, program: &str, pipe_writer: File) -> Result<(), Error> {
-    let mut child = spawn(cmd, program, pipe_writer)?;
-    wait_on_child(cmd, program, &mut child)
-}
-
-fn run(cmd: &mut Command, program: &str, print: &PrintThread) -> Result<(), Error> {
-    run_inner(cmd, program, print.pipe_writer_cloned()?.unwrap())?;
-
-    Ok(())
-}
-
-fn run_output(cmd: &mut Command, program: &str) -> Result<Vec<u8>, Error> {
-    cmd.stdout(Stdio::piped());
-
-    let mut print = PrintThread::new()?;
-    let mut child = spawn(cmd, program, print.pipe_writer().take().unwrap())?;
-
-    let mut stdout = vec![];
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_end(&mut stdout)
-        .unwrap();
-
-    wait_on_child(cmd, program, &mut child)?;
-
-    Ok(stdout)
-}
-
-fn spawn(cmd: &mut Command, program: &str, pipe_writer: File) -> Result<Child, Error> {
-    struct ResetStderr<'cmd>(&'cmd mut Command);
-
-    impl Drop for ResetStderr<'_> {
-        fn drop(&mut self) {
-            // Reset stderr to default to release pipe_writer so that print thread will
-            // not block forever.
-            self.0.stderr(Stdio::inherit());
-        }
-    }
-
-    println!("running: {:?}", cmd);
-
-    let cmd = ResetStderr(cmd);
-
-    match cmd.0.stderr(pipe_writer).spawn() {
-        Ok(child) => Ok(child),
-        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-            let extra = if cfg!(windows) {
-                " (see https://github.com/rust-lang/cc-rs#compile-time-requirements \
-                 for help)"
-            } else {
-                ""
-            };
-            Err(Error::new(
-                ErrorKind::ToolNotFound,
-                format!("Failed to find tool. Is `{}` installed?{}", program, extra),
-            ))
-        }
-        Err(e) => Err(Error::new(
-            ErrorKind::ToolExecError,
-            format!(
-                "Command {:?} with args {:?} failed to start: {:?}",
-                cmd.0, program, e
-            ),
-        )),
-    }
-}
-
 fn fail(s: &str) -> ! {
     eprintln!("\n\nerror occurred: {}\n\n", s);
     std::process::exit(1);
 }
 
-fn command_add_output_file(
-    cmd: &mut Command,
-    dst: &Path,
-    cuda: bool,
-    msvc: bool,
-    clang: bool,
-    gnu: bool,
-    is_asm: bool,
-    is_arm: bool,
-) {
-    if msvc && !clang && !gnu && !cuda && !(is_asm && is_arm) {
-        let mut s = OsString::from("-Fo");
-        s.push(&dst);
-        cmd.arg(s);
-    } else {
-        cmd.arg("-o").arg(&dst);
-    }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum AppleOs {
     MacOs,
     Ios,
@@ -3937,6 +3674,41 @@ impl std::fmt::Debug for AppleOs {
             AppleOs::TvOs => f.write_str("AppleTVOS"),
         }
     }
+}
+
+struct AppleSdkTargetParts {
+    sdk_prefix: &'static str,
+    sim_prefix: &'static str,
+    sdk: Cow<'static, str>,
+}
+
+fn apple_os_sdk_parts(os: AppleOs, arch: &AppleArchSpec) -> AppleSdkTargetParts {
+    let (sdk_prefix, sim_prefix) = match os {
+        AppleOs::MacOs => ("macosx", ""),
+        AppleOs::Ios => ("iphone", "ios-"),
+        AppleOs::WatchOs => ("watch", "watch"),
+        AppleOs::TvOs => ("appletv", "appletv"),
+    };
+    let sdk = match arch {
+        AppleArchSpec::Device(_) if os == AppleOs::MacOs => Cow::Borrowed("macosx"),
+        AppleArchSpec::Device(_) => format!("{}os", sdk_prefix).into(),
+        AppleArchSpec::Simulator(_) => format!("{}simulator", sdk_prefix).into(),
+        AppleArchSpec::Catalyst(_) => Cow::Borrowed("macosx"),
+    };
+
+    AppleSdkTargetParts {
+        sdk_prefix,
+        sim_prefix,
+        sdk,
+    }
+}
+
+#[allow(dead_code)]
+enum AppleArchSpec {
+    Device(&'static str),
+    Simulator(&'static str),
+    #[allow(dead_code)]
+    Catalyst(&'static str),
 }
 
 // Use by default minimum available API level
@@ -3960,7 +3732,7 @@ static NEW_STANDALONE_ANDROID_COMPILERS: [&str; 4] = [
 fn android_clang_compiler_uses_target_arg_internally(clang_path: &Path) -> bool {
     if let Some(filename) = clang_path.file_name() {
         if let Some(filename_str) = filename.to_str() {
-            if let Some(idx) = filename_str.rfind("-") {
+            if let Some(idx) = filename_str.rfind('-') {
                 return filename_str.split_at(idx).0.contains("android");
             }
         }
@@ -4073,13 +3845,23 @@ fn which(tool: &Path, path_entries: Option<OsString>) -> Option<PathBuf> {
     let path_entries = path_entries.or(env::var_os("PATH"))?;
     env::split_paths(&path_entries).find_map(|path_entry| {
         let mut exe = path_entry.join(tool);
-        return if check_exe(&mut exe) { Some(exe) } else { None };
+        if check_exe(&mut exe) {
+            Some(exe)
+        } else {
+            None
+        }
     })
 }
 
 // search for |prog| on 'programs' path in '|cc| -print-search-dirs' output
-fn search_programs(cc: &mut Command, prog: &str) -> Option<PathBuf> {
-    let search_dirs = run_output(cc.arg("-print-search-dirs"), "cc").ok()?;
+fn search_programs(cc: &mut Command, prog: &str, cargo_output: &CargoOutput) -> Option<PathBuf> {
+    let search_dirs = run_output(
+        cc.arg("-print-search-dirs"),
+        "cc",
+        // this doesn't concern the compilation so we always want to show warnings.
+        cargo_output,
+    )
+    .ok()?;
     // clang driver appears to be forcing UTF-8 output even on Windows,
     // hence from_utf8 is assumed to be usable in all cases.
     let search_dirs = std::str::from_utf8(&search_dirs).ok()?;
@@ -4113,84 +3895,5 @@ impl AsmFileExt {
             }
         }
         None
-    }
-}
-
-struct PrintThread {
-    handle: Option<JoinHandle<()>>,
-    pipe_writer: Option<File>,
-}
-
-impl PrintThread {
-    fn new() -> Result<Self, Error> {
-        let (pipe_reader, pipe_writer) = os_pipe::pipe()?;
-
-        // Capture the standard error coming from compilation, and write it out
-        // with cargo:warning= prefixes. Note that this is a bit wonky to avoid
-        // requiring the output to be UTF-8, we instead just ship bytes from one
-        // location to another.
-        let print = thread::spawn(move || {
-            let mut stderr = BufReader::with_capacity(4096, pipe_reader);
-            let mut line = Vec::with_capacity(20);
-            let stdout = io::stdout();
-
-            // read_until returns 0 on Eof
-            while stderr.read_until(b'\n', &mut line).unwrap() != 0 {
-                {
-                    let mut stdout = stdout.lock();
-
-                    stdout.write_all(b"cargo:warning=").unwrap();
-                    stdout.write_all(&line).unwrap();
-                    stdout.write_all(b"\n").unwrap();
-                }
-
-                // read_until does not clear the buffer
-                line.clear();
-            }
-        });
-
-        Ok(Self {
-            handle: Some(print),
-            pipe_writer: Some(pipe_writer),
-        })
-    }
-
-    fn pipe_writer(&mut self) -> &mut Option<File> {
-        &mut self.pipe_writer
-    }
-
-    fn pipe_writer_cloned(&self) -> Result<Option<File>, Error> {
-        self.pipe_writer
-            .as_ref()
-            .map(File::try_clone)
-            .transpose()
-            .map_err(From::from)
-    }
-}
-
-impl Drop for PrintThread {
-    fn drop(&mut self) {
-        // Drop pipe_writer first to avoid deadlock
-        self.pipe_writer.take();
-
-        self.handle.take().unwrap().join().unwrap();
-    }
-}
-
-/// Remove all element in `vec` which `f(element)` returns `false`.
-///
-/// TODO: Remove this once the MSRV is bumped to v1.61
-#[cfg(feature = "parallel")]
-fn retain_unordered_mut<T, F>(vec: &mut Vec<T>, mut f: F)
-where
-    F: FnMut(&mut T) -> bool,
-{
-    let mut i = 0;
-    while i < vec.len() {
-        if f(&mut vec[i]) {
-            i += 1;
-        } else {
-            vec.swap_remove(i);
-        }
     }
 }
