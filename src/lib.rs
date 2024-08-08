@@ -601,26 +601,17 @@ impl Build {
     /// `known_flag_support` field. If `is_flag_supported(flag)`
     /// is called again, the result will be read from the hash table.
     pub fn is_flag_supported(&self, flag: &str) -> Result<bool, Error> {
-        let target = self.get_target()?;
+        self.is_flag_supported_inner(flag, self.get_base_compiler()?.path(), &self.get_target()?)
+    }
 
-        let mut compiler = {
-            let mut cfg = Build::new();
-            cfg.flag(flag)
-                .cargo_metadata(self.cargo_output.metadata)
-                .target(&target)
-                .opt_level(0)
-                .host(&self.get_host()?)
-                .debug(false)
-                .cpp(self.cpp)
-                .cuda(self.cuda);
-            if let Some(ref c) = self.compiler {
-                cfg.compiler(c.clone());
-            }
-            cfg.try_get_compiler()?
-        };
-
+    fn is_flag_supported_inner(
+        &self,
+        flag: &str,
+        compiler_path: &Path,
+        target: &str,
+    ) -> Result<bool, Error> {
         let compiler_flag = CompilerFlag {
-            compiler: compiler.path.clone().into(),
+            compiler: compiler_path.into(),
             flag: flag.into(),
         };
 
@@ -637,6 +628,20 @@ impl Build {
         let out_dir = self.get_out_dir()?;
         let src = self.ensure_check_file()?;
         let obj = out_dir.join("flag_check");
+
+        let mut compiler = {
+            let mut cfg = Build::new();
+            cfg.flag(flag)
+                .compiler(compiler_path)
+                .cargo_metadata(self.cargo_output.metadata)
+                .target(target)
+                .opt_level(0)
+                .host(&self.get_host()?)
+                .debug(false)
+                .cpp(self.cpp)
+                .cuda(self.cuda);
+            cfg.try_get_compiler()?
+        };
 
         // Clang uses stderr for verbose output, which yields a false positive
         // result if the CFLAGS/CXXFLAGS include -v to aid in debugging.
@@ -1761,8 +1766,6 @@ impl Build {
 
         if !no_defaults {
             self.add_default_flags(&mut cmd, &target, &opt_level)?;
-        } else {
-            println!("Info: default compiler flags are disabled");
         }
 
         if let Some(ref std) = self.std {
@@ -1805,7 +1808,10 @@ impl Build {
         }
 
         for flag in self.flags_supported.iter() {
-            if self.is_flag_supported(flag).unwrap_or(false) {
+            if self
+                .is_flag_supported_inner(flag, &cmd.path, &target)
+                .unwrap_or(false)
+            {
                 cmd.push_cc_arg((**flag).into());
             }
         }
@@ -2837,11 +2843,9 @@ impl Build {
                     let tool = if self.cpp { "em++" } else { "emcc" };
                     // Windows uses bat file so we have to be a bit more specific
                     if cfg!(windows) {
-                        let mut t = Tool::new(
+                        let mut t = Tool::with_family(
                             PathBuf::from("cmd"),
-                            &self.cached_compiler_family,
-                            &self.cargo_output,
-                            out_dir,
+                            ToolFamily::Clang { zig_cc: false },
                         );
                         t.args.push("/c".into());
                         t.args.push(format!("{}.bat", tool).into());
@@ -3679,8 +3683,43 @@ impl Build {
     }
 
     fn apple_sdk_root(&self, sdk: &str) -> Result<OsString, Error> {
+        // Code copied from rustc's compiler/rustc_codegen_ssa/src/back/link.rs.
         if let Some(sdkroot) = env::var_os("SDKROOT") {
-            return Ok(sdkroot);
+            let p = PathBuf::from(sdkroot);
+            let sdkroot = p.to_string_lossy();
+            match sdk {
+                // Ignore `SDKROOT` if it's clearly set for the wrong platform.
+                "appletvos"
+                    if sdkroot.contains("TVSimulator.platform")
+                        || sdkroot.contains("MacOSX.platform") => {}
+                "appletvsimulator"
+                    if sdkroot.contains("TVOS.platform") || sdkroot.contains("MacOSX.platform") => {
+                }
+                "iphoneos"
+                    if sdkroot.contains("iPhoneSimulator.platform")
+                        || sdkroot.contains("MacOSX.platform") => {}
+                "iphonesimulator"
+                    if sdkroot.contains("iPhoneOS.platform")
+                        || sdkroot.contains("MacOSX.platform") => {}
+                "macosx10.15"
+                    if sdkroot.contains("iPhoneOS.platform")
+                        || sdkroot.contains("iPhoneSimulator.platform") => {}
+                "watchos"
+                    if sdkroot.contains("WatchSimulator.platform")
+                        || sdkroot.contains("MacOSX.platform") => {}
+                "watchsimulator"
+                    if sdkroot.contains("WatchOS.platform")
+                        || sdkroot.contains("MacOSX.platform") => {}
+                "xros"
+                    if sdkroot.contains("XRSimulator.platform")
+                        || sdkroot.contains("MacOSX.platform") => {}
+                "xrsimulator"
+                    if sdkroot.contains("XROS.platform") || sdkroot.contains("MacOSX.platform") => {
+                }
+                // Ignore `SDKROOT` if it's not a valid path.
+                _ if !p.is_absolute() || p == Path::new("/") || !p.exists() => {}
+                _ => return Ok(p.into()),
+            }
         }
 
         let mut cache = self
