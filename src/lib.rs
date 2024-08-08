@@ -1606,6 +1606,31 @@ impl Build {
                         } else if target.contains("aarch64") {
                             cmd.args.push("--target=aarch64-unknown-windows-gnu".into())
                         }
+                    } else if target.starts_with("e2k") {
+                        cmd.args.push("--target=e2k-unknown-linux-gnu".into());
+                        if target.starts_with("e2kv3") {
+                            cmd.args.push("-march=elbrus-v3".into());
+                        } else if target.starts_with("e2kv4") {
+                            cmd.args.push("-march=elbrus-v4".into());
+                        } else if target.starts_with("e2kv5") {
+                            cmd.args.push("-march=elbrus-v5".into());
+                        } else if target.starts_with("e2kv6") {
+                            cmd.args.push("-march=elbrus-v6".into());
+                        } else if target.starts_with("e2k4c") {
+                            cmd.args.push("-mtune=elbrus-4c".into());
+                        } else if target.starts_with("e2k8c") {
+                            cmd.args.push("-mtune=elbrus-8c".into());
+                        } else if target.starts_with("e2k1cplus") {
+                            cmd.args.push("-mtune=elbrus-1c+".into());
+                        } else if target.starts_with("e2k8c2") {
+                            cmd.args.push("-mtune=elbrus-8c2".into());
+                        } else if target.starts_with("e2k12c") {
+                            cmd.args.push("-mtune=elbrus-12c".into());
+                        } else if target.starts_with("e2k16c") {
+                            cmd.args.push("-mtune=elbrus-16c".into());
+                        } else if target.starts_with("e2k2c3") {
+                            cmd.args.push("-mtune=elbrus-2c3".into());
+                        }
                     } else {
                         cmd.args.push(format!("--target={}", target).into());
                     }
