@@ -1637,7 +1637,7 @@ impl Build {
                 cmd.args.push("-G".into());
             }
             let family = cmd.family;
-            family.add_debug_flags(cmd, self.get_dwarf_version());
+            family.add_debug_flags(cmd, self.get_dwarf_version(cmd.family));
         }
 
         if self.get_force_frame_pointer() {
@@ -2940,7 +2940,7 @@ impl Build {
         })
     }
 
-    fn get_dwarf_version(&self) -> Option<u32> {
+    fn get_dwarf_version(&self, family: ToolFamily) -> Option<u32> {
         // Tentatively matches the DWARF version defaults as of rustc 1.62.
         let target = self.get_target().ok()?;
         if target.contains("android")
@@ -2950,6 +2950,7 @@ impl Build {
             || target.contains("netbsd")
             || target.contains("openbsd")
             || target.contains("windows-gnu")
+            || (target.contains("e2k") && family == ToolFamily::Gnu)
         {
             Some(2)
         } else if target.contains("linux") {
