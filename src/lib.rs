@@ -84,6 +84,9 @@
 //! some cross compiling scenarios. Setting this variable
 //! will disable the generation of default compiler
 //! flags.
+//! * `CC_ENABLE_DEBUG_OUTPUT` - if set, compiler command invocations and exit codes will
+//! be logged to stdout. This is useful for debugging build script issues, but can be
+//! overly verbose for normal use.
 //! * `CXX...` - see [C++ Support](#c-support).
 //!
 //! Furthermore, projects using this crate may specify custom environment variables
@@ -1116,6 +1119,16 @@ impl Build {
     /// Issues unrelated to the compilation will always produce cargo warnings regardless of this setting.
     pub fn cargo_warnings(&mut self, cargo_warnings: bool) -> &mut Build {
         self.cargo_output.warnings = cargo_warnings;
+        self
+    }
+
+    /// Define whether debug information should be emitted for cargo. Defaults to whether
+    /// or not the environment variable `CC_ENABLE_DEBUG_OUTPUT` is set.
+    ///
+    /// If enabled, the compiler will emit debug information when generating object files,
+    /// such as the command invoked and the exit status.
+    pub fn cargo_debug(&mut self, cargo_debug: bool) -> &mut Build {
+        self.cargo_output.debug = cargo_debug;
         self
     }
 
@@ -2607,14 +2620,42 @@ impl Build {
                 "Detecting {:?} SDK path for {}",
                 os, sdk_details.sdk
             ));
-            let sdk_path = if let Some(sdkroot) = env::var_os("SDKROOT") {
-                sdkroot
-            } else {
-                self.apple_sdk_root(&sdk_details.sdk)?
-            };
+            let sdk_path = self.apple_sdk_root(&sdk_details.sdk)?;
 
             cmd.args.push("-isysroot".into());
             cmd.args.push(sdk_path);
+        }
+
+        if let AppleArchSpec::Catalyst(_) = arch {
+            // Mac Catalyst uses the macOS SDK, but to compile against and
+            // link to iOS-specific frameworks, we should have the support
+            // library stubs in the include and library search path.
+            let sdk_path = self.apple_sdk_root(&sdk_details.sdk)?;
+            let ios_support = PathBuf::from(sdk_path).join("/System/iOSSupport");
+
+            cmd.args.extend([
+                // Header search path
+                OsString::from("-isystem"),
+                ios_support.join("/usr/include").into(),
+                // Framework header search path
+                OsString::from("-iframework"),
+                ios_support.join("/System/Library/Frameworks").into(),
+                // Library search path
+                {
+                    let mut s = OsString::from("-L");
+                    s.push(&ios_support.join("/usr/lib"));
+                    s
+                },
+                // Framework linker search path
+                {
+                    // Technically, we _could_ avoid emitting `-F`, as
+                    // `-iframework` implies it, but let's keep it in for
+                    // clarity.
+                    let mut s = OsString::from("-F");
+                    s.push(&ios_support.join("/System/Library/Frameworks"));
+                    s
+                },
+            ]);
         }
 
         Ok(())
@@ -3515,6 +3556,10 @@ impl Build {
     }
 
     fn apple_sdk_root(&self, sdk: &str) -> Result<OsString, Error> {
+        if let Some(sdkroot) = env::var_os("SDKROOT") {
+            return Ok(sdkroot);
+        }
+
         let mut cache = self
             .apple_sdk_root_cache
             .lock()
