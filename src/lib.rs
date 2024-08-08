@@ -1395,7 +1395,7 @@ impl Build {
         }
 
         // Limit our parallelism globally with a jobserver.
-        let tokens = parallel::job_token::JobTokenServer::new();
+        let tokens = parallel::job_token::ActiveJobTokenServer::new()?;
 
         // When compiling objects in parallel we do a few dirty tricks to speed
         // things up:
@@ -3313,6 +3313,7 @@ impl Build {
             "armebv7r-none-eabihf" => Some("arm-none-eabi"),
             "armv7r-none-eabi" => Some("arm-none-eabi"),
             "armv7r-none-eabihf" => Some("arm-none-eabi"),
+            "armv8r-none-eabihf" => Some("arm-none-eabi"),
             "thumbv6m-none-eabi" => Some("arm-none-eabi"),
             "thumbv7em-none-eabi" => Some("arm-none-eabi"),
             "thumbv7em-none-eabihf" => Some("arm-none-eabi"),
