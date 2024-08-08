@@ -66,8 +66,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+#[cfg(feature = "parallel")]
+mod async_executor;
+#[cfg(feature = "parallel")]
+mod job_token;
 mod os_pipe;
-
 // These modules are all glue to support reading the MSVC version from
 // the registry and from COM interfaces
 #[cfg(windows)]
@@ -200,6 +203,7 @@ pub struct Tool {
     family: ToolFamily,
     cuda: bool,
     removed_args: Vec<OsString>,
+    has_internal_target_arg: bool,
 }
 
 /// Represents the family of tools this tool belongs to.
@@ -427,6 +431,24 @@ impl Build {
         self
     }
 
+    /// Removes a compiler flag that was added by [`Build::flag`].
+    ///
+    /// Will not remove flags added by other means (default flags,
+    /// flags from env, and so on).
+    ///
+    /// # Example
+    /// ```
+    /// cc::Build::new()
+    ///     .file("src/foo.c")
+    ///     .flag("unwanted_flag")
+    ///     .remove_flag("unwanted_flag");
+    /// ```
+
+    pub fn remove_flag(&mut self, flag: &str) -> &mut Build {
+        self.flags.retain(|other_flag| &**other_flag != flag);
+        self
+    }
+
     /// Add a flag to the invocation of the ar
     ///
     /// # Example
@@ -521,6 +543,11 @@ impl Build {
         if compiler.family.verbose_stderr() {
             compiler.remove_arg("-v".into());
         }
+        if compiler.family == ToolFamily::Clang {
+            // Avoid reporting that the arg is unsupported just because the
+            // compiler complains that it wasn't used.
+            compiler.push_cc_arg("-Wno-unused-command-line-argument".into());
+        }
 
         let mut cmd = compiler.to_command();
         let is_arm = target.contains("aarch64") || target.contains("arm");
@@ -537,11 +564,8 @@ impl Build {
             is_arm,
         );
 
-        // We need to explicitly tell msvc not to link and create an exe
-        // in the root directory of the crate
-        if target.contains("msvc") && !self.cuda {
-            cmd.arg("-c");
-        }
+        // Checking for compiler flags does not require linking
+        cmd.arg("-c");
 
         cmd.arg(&src);
 
@@ -1293,7 +1317,9 @@ impl Build {
 
     #[cfg(feature = "parallel")]
     fn compile_objects(&self, objs: &[Object], print: &PrintThread) -> Result<(), Error> {
-        use std::sync::{mpsc, Once};
+        use std::cell::Cell;
+
+        use async_executor::{block_on, YieldOnce};
 
         if objs.len() <= 1 {
             for obj in objs {
@@ -1304,14 +1330,8 @@ impl Build {
             return Ok(());
         }
 
-        // Limit our parallelism globally with a jobserver. Start off by
-        // releasing our own token for this process so we can have a bit of an
-        // easier to write loop below. If this fails, though, then we're likely
-        // on Windows with the main implicit token, so we just have a bit extra
-        // parallelism for a bit and don't reacquire later.
-        let server = jobserver();
-        // Reacquire our process's token on drop
-        let _reacquire = server.release_raw().ok().map(|_| JobserverToken(server));
+        // Limit our parallelism globally with a jobserver.
+        let tokens = crate::job_token::JobTokenServer::new();
 
         // When compiling objects in parallel we do a few dirty tricks to speed
         // things up:
@@ -1332,148 +1352,93 @@ impl Build {
         // acquire the appropriate tokens, Once all objects have been compiled
         // we wait on all the processes and propagate the results of compilation.
 
-        let (tx, rx) = mpsc::channel::<(_, String, KillOnDrop, _)>();
+        let pendings = Cell::new(Vec::<(
+            Command,
+            String,
+            KillOnDrop,
+            crate::job_token::JobToken,
+        )>::new());
+        let is_disconnected = Cell::new(false);
+        let has_made_progress = Cell::new(false);
 
-        // Since jobserver::Client::acquire can block, waiting
-        // must be done in parallel so that acquire won't block forever.
-        let wait_thread = thread::Builder::new().spawn(move || {
+        let wait_future = async {
             let mut error = None;
-            let mut pendings = Vec::new();
             // Buffer the stdout
             let mut stdout = io::BufWriter::with_capacity(128, io::stdout());
-            let mut backoff_cnt = 0;
 
             loop {
-                let mut has_made_progress = false;
+                // If the other end of the pipe is already disconnected, then we're not gonna get any new jobs,
+                // so it doesn't make sense to reuse the tokens; in fact,
+                // releasing them as soon as possible (once we know that the other end is disconnected) is beneficial.
+                // Imagine that the last file built takes an hour to finish; in this scenario,
+                // by not releasing the tokens before that last file is done we would effectively block other processes from
+                // starting sooner - even though we only need one token for that last file, not N others that were acquired.
 
-                // Reading new pending tasks
-                loop {
-                    match rx.try_recv() {
-                        Ok(pending) => {
-                            has_made_progress = true;
-                            pendings.push(pending)
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) if pendings.is_empty() => {
-                            let _ = stdout.flush();
-                            return if let Some(err) = error {
-                                Err(err)
-                            } else {
-                                Ok(())
-                            };
-                        }
-                        _ => break,
-                    }
-                }
+                let mut pendings_is_empty = false;
 
-                // Try waiting on them.
-                pendings.retain_mut(|(cmd, program, child, _)| {
-                    match try_wait_on_child(cmd, program, &mut child.0, &mut stdout) {
-                        Ok(Some(())) => {
-                            // Task done, remove the entry
-                            has_made_progress = true;
-                            false
-                        }
-                        Ok(None) => true, // Task still not finished, keep the entry
-                        Err(err) => {
-                            // Task fail, remove the entry.
-                            has_made_progress = true;
+                cell_update(&pendings, |mut pendings| {
+                    // Try waiting on them.
+                    retain_unordered_mut(&mut pendings, |(cmd, program, child, _token)| {
+                        match try_wait_on_child(cmd, program, &mut child.0, &mut stdout) {
+                            Ok(Some(())) => {
+                                // Task done, remove the entry
+                                has_made_progress.set(true);
+                                false
+                            }
+                            Ok(None) => true, // Task still not finished, keep the entry
+                            Err(err) => {
+                                // Task fail, remove the entry.
+                                // Since we can only return one error, log the error to make
+                                // sure users always see all the compilation failures.
+                                has_made_progress.set(true);
 
-                            // Since we can only return one error, log the error to make
-                            // sure users always see all the compilation failures.
-                            let _ = writeln!(stdout, "cargo:warning={}", err);
-                            error = Some(err);
+                                let _ = writeln!(stdout, "cargo:warning={}", err);
+                                error = Some(err);
 
-                            false
+                                false
+                            }
                         }
-                    }
+                    });
+                    pendings_is_empty = pendings.is_empty();
+                    pendings
                 });
 
-                if !has_made_progress {
-                    if backoff_cnt > 3 {
-                        // We have yielded at least three times without making'
-                        // any progress, so we will sleep for a while.
-                        let duration =
-                            std::time::Duration::from_millis(100 * (backoff_cnt - 3).min(10));
-                        thread::sleep(duration);
+                if pendings_is_empty && is_disconnected.get() {
+                    break if let Some(err) = error {
+                        Err(err)
                     } else {
-                        // Given that we spawned a lot of compilation tasks, it is unlikely
-                        // that OS cannot find other ready task to execute.
-                        //
-                        // If all of them are done, then we will yield them and spawn more,
-                        // or simply returns.
-                        //
-                        // Thus this will not be turned into a busy-wait loop and it will not
-                        // waste CPU resource.
-                        thread::yield_now();
+                        Ok(())
+                    };
+                }
+
+                YieldOnce::default().await;
+            }
+        };
+        let spawn_future = async {
+            for obj in objs {
+                let (mut cmd, program) = self.create_compile_object_cmd(obj)?;
+                let token = loop {
+                    if let Some(token) = tokens.try_acquire()? {
+                        break token;
+                    } else {
+                        YieldOnce::default().await
                     }
-                }
-
-                backoff_cnt = if has_made_progress {
-                    0
-                } else {
-                    backoff_cnt + 1
                 };
-            }
-        })?;
+                let child = spawn(&mut cmd, &program, print.pipe_writer_cloned()?.unwrap())?;
 
-        for obj in objs {
-            let (mut cmd, program) = self.create_compile_object_cmd(obj)?;
-            let token = server.acquire()?;
-
-            let child = spawn(&mut cmd, &program, print.pipe_writer_cloned()?.unwrap())?;
-
-            tx.send((cmd, program, KillOnDrop(child), token))
-                .expect("Wait thread must be alive until all compilation jobs are done, otherwise we risk deadlock");
-        }
-        // Drop tx so that the wait_thread could return
-        drop(tx);
-
-        return wait_thread.join().expect("wait_thread panics");
-
-        /// Returns a suitable `jobserver::Client` used to coordinate
-        /// parallelism between build scripts.
-        fn jobserver() -> &'static jobserver::Client {
-            static INIT: Once = Once::new();
-            static mut JOBSERVER: Option<jobserver::Client> = None;
-
-            fn _assert_sync<T: Sync>() {}
-            _assert_sync::<jobserver::Client>();
-
-            unsafe {
-                INIT.call_once(|| {
-                    let server = default_jobserver();
-                    JOBSERVER = Some(server);
+                cell_update(&pendings, |mut pendings| {
+                    pendings.push((cmd, program, KillOnDrop(child), token));
+                    pendings
                 });
-                JOBSERVER.as_ref().unwrap()
-            }
-        }
 
-        unsafe fn default_jobserver() -> jobserver::Client {
-            // Try to use the environmental jobserver which Cargo typically
-            // initializes for us...
-            if let Some(client) = jobserver::Client::from_env() {
-                return client;
+                has_made_progress.set(true);
             }
+            is_disconnected.set(true);
 
-            // ... but if that fails for whatever reason select something
-            // reasonable and crate a new jobserver. Use `NUM_JOBS` if set (it's
-            // configured by Cargo) and otherwise just fall back to a
-            // semi-reasonable number. Note that we could use `num_cpus` here
-            // but it's an extra dependency that will almost never be used, so
-            // it's generally not too worth it.
-            let mut parallelism = 4;
-            if let Ok(amt) = env::var("NUM_JOBS") {
-                if let Ok(amt) = amt.parse() {
-                    parallelism = amt;
-                }
-            }
+            Ok::<_, Error>(())
+        };
 
-            // If we create our own jobserver then be sure to reserve one token
-            // for ourselves.
-            let client = jobserver::Client::new(parallelism).expect("failed to create jobserver");
-            client.acquire_raw().expect("failed to acquire initial");
-            return client;
-        }
+        return block_on(wait_future, spawn_future, &has_made_progress);
 
         struct KillOnDrop(Child);
 
@@ -1485,11 +1450,14 @@ impl Build {
             }
         }
 
-        struct JobserverToken(&'static jobserver::Client);
-        impl Drop for JobserverToken {
-            fn drop(&mut self) {
-                let _ = self.0.acquire_raw();
-            }
+        fn cell_update<T, F>(cell: &Cell<T>, f: F)
+        where
+            T: Default,
+            F: FnOnce(T) -> T,
+        {
+            let old = cell.take();
+            let new = f(old);
+            cell.set(new);
         }
     }
 
@@ -1512,7 +1480,8 @@ impl Build {
         let clang = compiler.family == ToolFamily::Clang;
         let gnu = compiler.family == ToolFamily::Gnu;
 
-        let (mut cmd, name) = if msvc && asm_ext == Some(AsmFileExt::DotAsm) {
+        let is_assembler_msvc = msvc && asm_ext == Some(AsmFileExt::DotAsm);
+        let (mut cmd, name) = if is_assembler_msvc {
             self.msvc_macro_assembler()?
         } else {
             let mut cmd = compiler.to_command();
@@ -1534,7 +1503,7 @@ impl Build {
             &mut cmd, &obj.dst, self.cuda, msvc, clang, gnu, is_asm, is_arm,
         );
         // armasm and armasm64 don't requrie -c option
-        if !msvc || !is_asm || !is_arm {
+        if !is_assembler_msvc || !is_arm {
             cmd.arg("-c");
         }
         if self.cuda && self.cuda_file_count() > 1 {
@@ -1543,7 +1512,7 @@ impl Build {
         if is_asm {
             cmd.args(self.asm_flags.iter().map(std::ops::Deref::deref));
         }
-        if compiler.family == (ToolFamily::Msvc { clang_cl: true }) && !is_asm {
+        if compiler.family == (ToolFamily::Msvc { clang_cl: true }) && !is_assembler_msvc {
             // #513: For `clang-cl`, separate flags/options from the input file.
             // When cross-compiling macOS -> Windows, this avoids interpreting
             // common `/Users/...` paths as the `/U` flag and triggering
@@ -1773,7 +1742,10 @@ impl Build {
                     cmd.push_opt_unless_duplicate("-DANDROID".into());
                 }
 
-                if !target.contains("apple-ios") && !target.contains("apple-watchos") {
+                if !target.contains("apple-ios")
+                    && !target.contains("apple-watchos")
+                    && !target.contains("apple-tvos")
+                {
                     cmd.push_cc_arg("-ffunction-sections".into());
                     cmd.push_cc_arg("-fdata-sections".into());
                 }
@@ -1807,12 +1779,20 @@ impl Build {
             family.add_force_frame_pointer(cmd);
         }
 
+        if !cmd.is_like_msvc() {
+            if target.contains("i686") || target.contains("i586") {
+                cmd.args.push("-m32".into());
+            } else if target == "x86_64-unknown-linux-gnux32" {
+                cmd.args.push("-mx32".into());
+            } else if target.contains("x86_64") || target.contains("powerpc64") {
+                cmd.args.push("-m64".into());
+            }
+        }
+
         // Target flags
         match cmd.family {
             ToolFamily::Clang => {
-                if !(target.contains("android")
-                    && android_clang_compiler_uses_target_arg_internally(&cmd.path))
-                {
+                if !(target.contains("android") && cmd.has_internal_target_arg) {
                     if target.contains("darwin") {
                         if let Some(arch) =
                             map_darwin_target_from_rust_to_compiler_architecture(target)
@@ -1831,8 +1811,8 @@ impl Build {
                         if let Some(arch) =
                             map_darwin_target_from_rust_to_compiler_architecture(target)
                         {
-                            let deployment_target = env::var("IPHONEOS_DEPLOYMENT_TARGET")
-                                .unwrap_or_else(|_| "7.0".into());
+                            let deployment_target =
+                                self.apple_deployment_version(AppleOs::Ios, target, None);
                             cmd.args.push(
                                 format!(
                                     "--target={}-apple-ios{}-simulator",
@@ -1845,14 +1825,38 @@ impl Build {
                         if let Some(arch) =
                             map_darwin_target_from_rust_to_compiler_architecture(target)
                         {
-                            let deployment_target = env::var("WATCHOS_DEPLOYMENT_TARGET")
-                                .unwrap_or_else(|_| "5.0".into());
+                            let deployment_target =
+                                self.apple_deployment_version(AppleOs::WatchOs, target, None);
                             cmd.args.push(
                                 format!(
                                     "--target={}-apple-watchos{}-simulator",
                                     arch, deployment_target
                                 )
                                 .into(),
+                            );
+                        }
+                    } else if target.contains("x86_64-apple-tvos") {
+                        if let Some(arch) =
+                            map_darwin_target_from_rust_to_compiler_architecture(target)
+                        {
+                            let deployment_target =
+                                self.apple_deployment_version(AppleOs::TvOs, target, None);
+                            cmd.args.push(
+                                format!(
+                                    "--target={}-apple-tvos{}-simulator",
+                                    arch, deployment_target
+                                )
+                                .into(),
+                            );
+                        }
+                    } else if target.contains("aarch64-apple-tvos") {
+                        if let Some(arch) =
+                            map_darwin_target_from_rust_to_compiler_architecture(target)
+                        {
+                            let deployment_target =
+                                self.apple_deployment_version(AppleOs::TvOs, target, None);
+                            cmd.args.push(
+                                format!("--target={}-apple-tvos{}", arch, deployment_target).into(),
                             );
                         }
                     } else if target.starts_with("riscv64gc-") {
@@ -1961,14 +1965,6 @@ impl Build {
                 }
             }
             ToolFamily::Gnu => {
-                if target.contains("i686") || target.contains("i586") {
-                    cmd.args.push("-m32".into());
-                } else if target == "x86_64-unknown-linux-gnux32" {
-                    cmd.args.push("-mx32".into());
-                } else if target.contains("x86_64") || target.contains("powerpc64") {
-                    cmd.args.push("-m64".into());
-                }
-
                 if target.contains("darwin") {
                     if let Some(arch) = map_darwin_target_from_rust_to_compiler_architecture(target)
                     {
@@ -2165,8 +2161,8 @@ impl Build {
             }
         }
 
-        if target.contains("apple-ios") || target.contains("apple-watchos") {
-            self.ios_watchos_flags(cmd)?;
+        if target.contains("-apple-") {
+            self.apple_flags(cmd)?;
         }
 
         if self.static_flag.unwrap_or(false) {
@@ -2226,7 +2222,20 @@ impl Build {
                 cmd.arg("-g");
             }
 
-            println!("cargo:warning=The MSVC ARM assemblers do not support -D flags");
+            for &(ref key, ref value) in self.definitions.iter() {
+                cmd.arg("-PreDefine");
+                if let Some(ref value) = *value {
+                    if let Ok(i) = value.parse::<i32>() {
+                        cmd.arg(&format!("{} SETA {}", key, i));
+                    } else if value.starts_with('"') && value.ends_with('"') {
+                        cmd.arg(&format!("{} SETS {}", key, value));
+                    } else {
+                        cmd.arg(&format!("{} SETS \"{}\"", key, value));
+                    }
+                } else {
+                    cmd.arg(&format!("{} SETL {}", key, "{TRUE}"));
+                }
+            }
         } else {
             if self.get_debug() {
                 cmd.arg("-Zi");
@@ -2243,9 +2252,6 @@ impl Build {
 
         if target.contains("i686") || target.contains("i586") {
             cmd.arg("-safeseh");
-        }
-        for flag in self.flags.iter() {
-            cmd.arg(&**flag);
         }
 
         Ok((cmd, tool.to_string()))
@@ -2384,37 +2390,32 @@ impl Build {
         Ok(())
     }
 
-    fn ios_watchos_flags(&self, cmd: &mut Tool) -> Result<(), Error> {
+    fn apple_flags(&self, cmd: &mut Tool) -> Result<(), Error> {
         enum ArchSpec {
             Device(&'static str),
             Simulator(&'static str),
             Catalyst(&'static str),
         }
 
-        enum Os {
-            Ios,
-            WatchOs,
-        }
-        impl Display for Os {
-            fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-                match self {
-                    Os::Ios => f.write_str("iOS"),
-                    Os::WatchOs => f.write_str("WatchOS"),
-                }
-            }
-        }
-
         let target = self.get_target()?;
-        let os = if target.contains("-watchos") {
-            Os::WatchOs
+        let os = if target.contains("-darwin") {
+            AppleOs::MacOs
+        } else if target.contains("-watchos") {
+            AppleOs::WatchOs
+        } else if target.contains("-tvos") {
+            AppleOs::TvOs
         } else {
-            Os::Ios
+            AppleOs::Ios
+        };
+        let is_mac = match os {
+            AppleOs::MacOs => true,
+            _ => false,
         };
 
-        let arch = target.split('-').nth(0).ok_or_else(|| {
+        let arch_str = target.split('-').nth(0).ok_or_else(|| {
             Error::new(
                 ErrorKind::ArchitectureInvalid,
-                format!("Unknown architecture for {} target.", os),
+                format!("Unknown architecture for {:?} target.", os),
             )
         })?;
 
@@ -2423,16 +2424,27 @@ impl Build {
             None => false,
         };
 
-        let is_sim = match target.split('-').nth(3) {
+        let is_arm_sim = match target.split('-').nth(3) {
             Some(v) => v == "sim",
             None => false,
         };
 
-        let arch = if is_catalyst {
-            match arch {
+        let arch = if is_mac {
+            match arch_str {
+                "i686" => ArchSpec::Device("-m32"),
+                "x86_64" | "x86_64h" | "aarch64" => ArchSpec::Device("-m64"),
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::ArchitectureInvalid,
+                        "Unknown architecture for macOS target.",
+                    ));
+                }
+            }
+        } else if is_catalyst {
+            match arch_str {
                 "arm64e" => ArchSpec::Catalyst("arm64e"),
                 "arm64" | "aarch64" => ArchSpec::Catalyst("arm64"),
-                "x86_64" => ArchSpec::Catalyst("-m64"),
+                "x86_64" | "x86_64h" => ArchSpec::Catalyst("-m64"),
                 _ => {
                     return Err(Error::new(
                         ErrorKind::ArchitectureInvalid,
@@ -2440,19 +2452,19 @@ impl Build {
                     ));
                 }
             }
-        } else if is_sim {
-            match arch {
+        } else if is_arm_sim {
+            match arch_str {
                 "arm64" | "aarch64" => ArchSpec::Simulator("arm64"),
-                "x86_64" => ArchSpec::Simulator("-m64"),
+                "x86_64" | "x86_64h" => ArchSpec::Simulator("-m64"),
                 _ => {
                     return Err(Error::new(
                         ErrorKind::ArchitectureInvalid,
-                        "Unknown architecture for iOS simulator target.",
+                        "Unknown architecture for simulator target.",
                     ));
                 }
             }
         } else {
-            match arch {
+            match arch_str {
                 "arm" | "armv7" | "thumbv7" => ArchSpec::Device("armv7"),
                 "armv7k" => ArchSpec::Device("armv7k"),
                 "armv7s" | "thumbv7s" => ArchSpec::Device("armv7s"),
@@ -2460,30 +2472,30 @@ impl Build {
                 "arm64" | "aarch64" => ArchSpec::Device("arm64"),
                 "arm64_32" => ArchSpec::Device("arm64_32"),
                 "i386" | "i686" => ArchSpec::Simulator("-m32"),
-                "x86_64" => ArchSpec::Simulator("-m64"),
+                "x86_64" | "x86_64h" => ArchSpec::Simulator("-m64"),
                 _ => {
                     return Err(Error::new(
                         ErrorKind::ArchitectureInvalid,
-                        format!("Unknown architecture for {} target.", os),
+                        format!("Unknown architecture for {:?} target.", os),
                     ));
                 }
             }
         };
 
-        let (sdk_prefix, sim_prefix, min_version) = match os {
-            Os::Ios => (
-                "iphone",
-                "ios-",
-                std::env::var("IPHONEOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "7.0".into()),
-            ),
-            Os::WatchOs => (
-                "watch",
-                "watch",
-                std::env::var("WATCHOS_DEPLOYMENT_TARGET").unwrap_or_else(|_| "2.0".into()),
-            ),
+        let min_version = self.apple_deployment_version(os, &target, Some(arch_str));
+        let (sdk_prefix, sim_prefix) = match os {
+            AppleOs::MacOs => ("macosx", ""),
+            AppleOs::Ios => ("iphone", "ios-"),
+            AppleOs::WatchOs => ("watch", "watch"),
+            AppleOs::TvOs => ("appletv", "appletv"),
         };
 
         let sdk = match arch {
+            ArchSpec::Device(_) if is_mac => {
+                cmd.args
+                    .push(format!("-mmacosx-version-min={}", min_version).into());
+                "macosx".to_owned()
+            }
             ArchSpec::Device(arch) => {
                 cmd.args.push("-arch".into());
                 cmd.args.push(arch.into());
@@ -2506,17 +2518,18 @@ impl Build {
             ArchSpec::Catalyst(_) => "macosx".to_owned(),
         };
 
-        self.print(&format_args!("Detecting {} SDK path for {}", os, sdk));
-        let sdk_path = if let Some(sdkroot) = env::var_os("SDKROOT") {
-            sdkroot
-        } else {
-            self.apple_sdk_root(sdk.as_str())?
-        };
+        // AppleClang sometimes requires sysroot even for darwin
+        if cmd.is_xctoolchain_clang() || !target.ends_with("-darwin") {
+            self.print(&format_args!("Detecting {:?} SDK path for {}", os, sdk));
+            let sdk_path = if let Some(sdkroot) = env::var_os("SDKROOT") {
+                sdkroot
+            } else {
+                self.apple_sdk_root(sdk.as_str())?
+            };
 
-        cmd.args.push("-isysroot".into());
-        cmd.args.push(sdk_path);
-        // TODO: Remove this once Apple stops accepting apps built with Xcode 13
-        cmd.args.push("-fembed-bitcode".into());
+            cmd.args.push("-isysroot".into());
+            cmd.args.push(sdk_path);
+        }
 
         Ok(())
     }
@@ -2608,6 +2621,8 @@ impl Build {
                     clang.to_string()
                 } else if target.contains("apple-watchos") {
                     clang.to_string()
+                } else if target.contains("apple-tvos") {
+                    clang.to_string()
                 } else if target.contains("android") {
                     autodetect_android_compiler(&target, &host, gnu, clang)
                 } else if target.contains("cloudabi") {
@@ -2684,6 +2699,7 @@ impl Build {
                 let file_name = path.to_str().unwrap().to_owned();
                 let (target, clang) = file_name.split_at(file_name.rfind("-").unwrap());
 
+                tool.has_internal_target_arg = true;
                 tool.path.set_file_name(clang.trim_start_matches("-"));
                 tool.path.set_extension("exe");
                 tool.args.push(format!("--target={}", target).into());
@@ -3372,19 +3388,6 @@ impl Build {
         let target = self.get_target()?;
         let host = self.get_host()?;
         if host.contains("apple-darwin") && target.contains("apple-darwin") {
-            // If, for example, `cargo` runs during the build of an XCode project, then `SDKROOT` environment variable
-            // would represent the current target, and this is the problem for us, if we want to compile something
-            // for the host, when host != target.
-            // We can not just remove `SDKROOT`, because, again, for example, XCode add to PATH
-            // /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
-            // and `cc` from this path can not find system include files, like `pthread.h`, if `SDKROOT`
-            // is not set
-            if let Ok(sdkroot) = env::var("SDKROOT") {
-                if !sdkroot.contains("MacOSX") {
-                    let macos_sdk = self.apple_sdk_root("macosx")?;
-                    cmd.env("SDKROOT", macos_sdk);
-                }
-            }
             // Additionally, `IPHONEOS_DEPLOYMENT_TARGET` must not be set when using the Xcode linker at
             // "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld",
             // although this is apparently ignored when using the linker at "/usr/bin/ld".
@@ -3424,6 +3427,71 @@ impl Build {
         Ok(ret)
     }
 
+    fn apple_deployment_version(
+        &self,
+        os: AppleOs,
+        target: &str,
+        arch_str: Option<&str>,
+    ) -> String {
+        fn rustc_provided_target(rustc: Option<&str>, target: &str) -> Option<String> {
+            let rustc = rustc?;
+            let output = Command::new(rustc)
+                .args(&["--target", target])
+                .args(&["--print", "deployment-target"])
+                .output()
+                .ok()?;
+
+            if output.status.success() {
+                std::str::from_utf8(&output.stdout)
+                    .unwrap()
+                    .strip_prefix("deployment_target=")
+                    .map(|v| v.trim())
+                    .map(ToString::to_string)
+            } else {
+                // rustc is < 1.71
+                None
+            }
+        }
+
+        let rustc = self.getenv("RUSTC");
+        let rustc = rustc.as_deref();
+        // note the hardcoded minimums here are subject to change in a future compiler release,
+        // so the ones rustc knows about are preferred. For any compiler version that has bumped them
+        // though, `--print deployment-target` will be present and the fallbacks won't be used.
+        //
+        // the ordering of env -> rustc -> old defaults is intentional for performance when using
+        // an explicit target
+        match os {
+            AppleOs::MacOs => env::var("MACOSX_DEPLOYMENT_TARGET")
+                .ok()
+                .or_else(|| rustc_provided_target(rustc, target))
+                .unwrap_or_else(|| {
+                    if arch_str == Some("aarch64") {
+                        "11.0"
+                    } else {
+                        if self.cpp {
+                            "10.9"
+                        } else {
+                            "10.7"
+                        }
+                    }
+                    .into()
+                }),
+            AppleOs::Ios => env::var("IPHONEOS_DEPLOYMENT_TARGET")
+                .ok()
+                .or_else(|| rustc_provided_target(rustc, target))
+                .unwrap_or_else(|| "7.0".into()),
+            AppleOs::WatchOs => env::var("WATCHOS_DEPLOYMENT_TARGET")
+                .ok()
+                .or_else(|| rustc_provided_target(rustc, target))
+                .unwrap_or_else(|| "5.0".into()),
+            AppleOs::TvOs => env::var("TVOS_DEPLOYMENT_TARGET")
+                .ok()
+                .or_else(|| rustc_provided_target(rustc, target))
+                .unwrap_or_else(|| "9.0".into()),
+        }
+    }
+
     fn cuda_file_count(&self) -> usize {
         self.files
             .iter()
@@ -3459,10 +3527,40 @@ impl Tool {
             family: family,
             cuda: false,
             removed_args: Vec::new(),
+            has_internal_target_arg: false,
         }
     }
 
     fn with_features(path: PathBuf, clang_driver: Option<&str>, cuda: bool) -> Self {
+        fn detect_family(path: &Path) -> ToolFamily {
+            let mut cmd = Command::new(path);
+            cmd.arg("--version");
+
+            let stdout = match run_output(&mut cmd, &path.to_string_lossy())
+                .ok()
+                .and_then(|o| String::from_utf8(o).ok())
+            {
+                Some(s) => s,
+                None => {
+                    // --version failed. fallback to gnu
+                    println!("cargo-warning:Failed to run: {:?}", cmd);
+                    return ToolFamily::Gnu;
+                }
+            };
+            if stdout.contains("clang") {
+                ToolFamily::Clang
+            } else if stdout.contains("GCC") {
+                ToolFamily::Gnu
+            } else {
+                // --version doesn't include clang for GCC
+                println!(
+                    "cargo-warning:Compiler version doesn't include clang or GCC: {:?}",
+                    cmd
+                );
+                ToolFamily::Gnu
+            }
+        }
+
         // Try to detect family of the tool from its name, falling back to Gnu.
         let family = if let Some(fname) = path.file_name().and_then(|p| p.to_str()) {
             if fname.contains("clang-cl") {
@@ -3475,10 +3573,10 @@ impl Tool {
                     _ => ToolFamily::Clang,
                 }
             } else {
-                ToolFamily::Gnu
+                detect_family(&path)
             }
         } else {
-            ToolFamily::Gnu
+            detect_family(&path)
         };
 
         Tool {
@@ -3490,6 +3588,7 @@ impl Tool {
             family: family,
             cuda: cuda,
             removed_args: Vec::new(),
+            has_internal_target_arg: false,
         }
     }
 
@@ -3645,6 +3744,17 @@ impl Tool {
     /// Whether the tool is Clang-like.
     pub fn is_like_clang(&self) -> bool {
         self.family == ToolFamily::Clang
+    }
+
+    /// Whether the tool is AppleClang under .xctoolchain
+    #[cfg(target_vendor = "apple")]
+    fn is_xctoolchain_clang(&self) -> bool {
+        let path = self.path.to_string_lossy();
+        path.contains(".xctoolchain/")
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    fn is_xctoolchain_clang(&self) -> bool {
+        false
     }
 
     /// Whether the tool is MSVC-like.
@@ -3808,6 +3918,24 @@ fn command_add_output_file(
         cmd.arg(s);
     } else {
         cmd.arg("-o").arg(&dst);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AppleOs {
+    MacOs,
+    Ios,
+    WatchOs,
+    TvOs,
+}
+impl std::fmt::Debug for AppleOs {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            AppleOs::MacOs => f.write_str("macOS"),
+            AppleOs::Ios => f.write_str("iOS"),
+            AppleOs::WatchOs => f.write_str("WatchOS"),
+            AppleOs::TvOs => f.write_str("AppleTVOS"),
+        }
     }
 }
 
@@ -4046,5 +4174,23 @@ impl Drop for PrintThread {
         self.pipe_writer.take();
 
         self.handle.take().unwrap().join().unwrap();
+    }
+}
+
+/// Remove all element in `vec` which `f(element)` returns `false`.
+///
+/// TODO: Remove this once the MSRV is bumped to v1.61
+#[cfg(feature = "parallel")]
+fn retain_unordered_mut<T, F>(vec: &mut Vec<T>, mut f: F)
+where
+    F: FnMut(&mut T) -> bool,
+{
+    let mut i = 0;
+    while i < vec.len() {
+        if f(&mut vec[i]) {
+            i += 1;
+        } else {
+            vec.swap_remove(i);
+        }
     }
 }

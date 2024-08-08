@@ -55,7 +55,11 @@ fn gnu_opt_level_s() {
 #[test]
 fn gnu_debug() {
     let test = Test::gnu();
-    test.gcc().debug(true).file("foo.c").compile("foo");
+    test.gcc()
+        .target("x86_64-unknown-linux")
+        .debug(true)
+        .file("foo.c")
+        .compile("foo");
     test.cmd(0).must_have("-gdwarf-4");
 
     let test = Test::gnu();
@@ -70,7 +74,11 @@ fn gnu_debug() {
 #[test]
 fn gnu_debug_fp_auto() {
     let test = Test::gnu();
-    test.gcc().debug(true).file("foo.c").compile("foo");
+    test.gcc()
+        .target("x86_64-unknown-linux")
+        .debug(true)
+        .file("foo.c")
+        .compile("foo");
     test.cmd(0).must_have("-gdwarf-4");
     test.cmd(0).must_have("-fno-omit-frame-pointer");
 }
@@ -78,7 +86,11 @@ fn gnu_debug_fp_auto() {
 #[test]
 fn gnu_debug_fp() {
     let test = Test::gnu();
-    test.gcc().debug(true).file("foo.c").compile("foo");
+    test.gcc()
+        .target("x86_64-unknown-linux")
+        .debug(true)
+        .file("foo.c")
+        .compile("foo");
     test.cmd(0).must_have("-gdwarf-4");
     test.cmd(0).must_have("-fno-omit-frame-pointer");
 }
@@ -89,6 +101,7 @@ fn gnu_debug_nofp() {
 
     let test = Test::gnu();
     test.gcc()
+        .target("x86_64-unknown-linux")
         .debug(true)
         .force_frame_pointer(false)
         .file("foo.c")
@@ -98,6 +111,7 @@ fn gnu_debug_nofp() {
 
     let test = Test::gnu();
     test.gcc()
+        .target("x86_64-unknown-linux")
         .force_frame_pointer(false)
         .debug(true)
         .file("foo.c")
@@ -329,11 +343,9 @@ fn gnu_flag_if_supported() {
         .must_not_have("-std=c++11");
 }
 
+#[cfg(not(windows))]
 #[test]
 fn gnu_flag_if_supported_cpp() {
-    if cfg!(windows) {
-        return;
-    }
     let test = Test::gnu();
     test.gcc()
         .cpp(true)
@@ -474,4 +486,54 @@ fn asm_flags() {
     test.cmd(0).must_not_have("--abc");
     test.cmd(1).must_have("--abc");
     test.cmd(2).must_have("--abc");
+}
+
+#[test]
+fn gnu_apple_darwin() {
+    for (arch, version) in &[("x86_64", "10.7"), ("aarch64", "11.0")] {
+        let target = format!("{}-apple-darwin", arch);
+        let test = Test::gnu();
+        test.gcc()
+            .target(&target)
+            .host(&target)
+            // Avoid test maintainence when minimum supported OSes change.
+            .__set_env("MACOSX_DEPLOYMENT_TARGET", version)
+            .file("foo.c")
+            .compile("foo");
+
+        let cmd = test.cmd(0);
+        test.cmd(0)
+            .must_have(format!("-mmacosx-version-min={}", version));
+        cmd.must_not_have("-isysroot");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn clang_apple_tvos() {
+    for target in &["aarch64-apple-tvos"] {
+        let test = Test::clang();
+        test.gcc()
+            .target(&target)
+            .host(&target)
+            .file("foo.c")
+            .compile("foo");
+
+        test.cmd(0).must_have("-mappletvos-version-min=9.0");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn clang_apple_tvsimulator() {
+    for target in &["x86_64-apple-tvos"] {
+        let test = Test::clang();
+        test.gcc()
+            .target(&target)
+            .host(&target)
+            .file("foo.c")
+            .compile("foo");
+
+        test.cmd(0).must_have("-mappletvsimulator-version-min=9.0");
+    }
 }

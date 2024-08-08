@@ -68,7 +68,7 @@ jobs:
             rust: stable-x86_64
             target: x86_64-pc-windows-msvc
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install Rust (rustup)
       run: |
         set -euxo pipefail
@@ -92,11 +92,29 @@ jobs:
     - run: cargo test ${{ matrix.no_run }} --manifest-path cc-test/Cargo.toml --target ${{ matrix.target }} --features parallel
     - run: cargo test ${{ matrix.no_run }} --manifest-path cc-test/Cargo.toml --target ${{ matrix.target }} --release
 
+  check-tvos:
+    name: Test aarch64-apple-tvos
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust (rustup)
+      run: |
+        set -euxo pipefail
+        rustup toolchain install nightly --no-self-update --profile minimal
+        rustup component add rust-src --toolchain nightly
+        rustup default nightly
+      shell: bash
+    - run: cargo test -Z build-std=std --no-run --target aarch64-apple-tvos
+    - run: cargo test -Z build-std=std --no-run --features parallel --target aarch64-apple-tvos
+    - run: cargo test -Z build-std=std --no-run --manifest-path cc-test/Cargo.toml --target aarch64-apple-tvos
+    - run: cargo test -Z build-std=std --no-run --manifest-path cc-test/Cargo.toml --target aarch64-apple-tvos --features parallel
+    - run: cargo test -Z build-std=std --no-run --manifest-path cc-test/Cargo.toml --target aarch64-apple-tvos --release
+
   cuda:
     name: Test CUDA support
     runs-on: ubuntu-20.04
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install cuda-minimal-build-11-8
       shell: bash
       run: |
@@ -114,22 +132,29 @@ jobs:
     name: MSRV
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install Rust
       run: |
-        rustup toolchain install 1.46.0 --no-self-update --profile minimal
-        rustup default 1.46.0
+        rustup toolchain install 1.53.0 --no-self-update --profile minimal
+        rustup toolchain install nightly --no-self-update --profile minimal
+        rustup default 1.53.0
       shell: bash
+    - name: Create Cargo.lock with minimal version
+      run: cargo +nightly update -Zminimal-versions
+    - name: Cache downloaded crates since 1.53 is really slow in fetching
+      uses: Swatinem/rust-cache@v2
     - run: cargo check --lib
+    - run: cargo check --lib --all-features
 
   rustfmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install Rust
       run: |
         rustup toolchain install stable --no-self-update --profile minimal --component rustfmt
