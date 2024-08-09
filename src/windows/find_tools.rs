@@ -142,14 +142,13 @@ pub fn find_vs_version() -> Result<VsVers, String> {
             } else if impl_::has_msbuild_version("12.0") {
                 Ok(VsVers::Vs12)
             } else {
-                Err(format!(
-                    "\n\n\
+                Err("\n\n\
                      couldn't determine visual studio generator\n\
                      if VisualStudio is installed, however, consider \
                      running the appropriate vcvars script before building \
                      this crate\n\
                      "
-                ))
+                .to_string())
             }
         }
     }
@@ -163,7 +162,7 @@ mod impl_ {
     use crate::windows::setup_config::SetupConfiguration;
     use crate::windows::vs_instances::{VsInstances, VswhereInstance};
     use crate::windows::windows_sys::{
-        FreeLibrary, GetMachineTypeAttributes, GetProcAddress, LoadLibraryA, UserEnabled, HMODULE,
+        GetMachineTypeAttributes, GetProcAddress, LoadLibraryA, UserEnabled, HMODULE,
         IMAGE_FILE_MACHINE_AMD64, MACHINE_ATTRIBUTES, S_OK,
     };
     use std::convert::TryFrom;
@@ -208,12 +207,6 @@ mod impl_ {
         unsafe fn get_proc_address<F>(&self, name: &[u8]) -> Option<F> {
             let symbol = unsafe { GetProcAddress(self.0, name.as_ptr() as _) };
             symbol.map(|symbol| unsafe { mem::transmute_copy(&symbol) })
-        }
-    }
-
-    impl Drop for LibraryHandle {
-        fn drop(&mut self) {
-            unsafe { FreeLibrary(self.0) };
         }
     }
 
@@ -302,10 +295,8 @@ mod impl_ {
     /// Attempt to find the tool using environment variables set by vcvars.
     pub(super) fn find_msvc_environment(tool: &str, target: TargetArch<'_>) -> Option<Tool> {
         // Early return if the environment doesn't contain a VC install.
-        if env::var_os("VCINSTALLDIR").is_none() {
-            return None;
-        }
-        let vs_install_dir = env::var_os("VSINSTALLDIR")?.into();
+        env::var_os("VCINSTALLDIR")?;
+        let vs_install_dir: PathBuf = env::var_os("VSINSTALLDIR")?.into();
 
         // If the vscmd target differs from the requested target then
         // attempt to get the tool using the VS install directory.
@@ -340,9 +331,9 @@ mod impl_ {
         };
         Box::new(instances.into_iter().filter_map(move |instance| {
             let installation_name = instance.installation_name()?;
-            if installation_name.starts_with(&format!("VisualStudio/{}.", version)) {
-                Some(instance.installation_path()?)
-            } else if installation_name.starts_with(&format!("VisualStudioPreview/{}.", version)) {
+            if installation_name.starts_with(&format!("VisualStudio/{}.", version))
+                || installation_name.starts_with(&format!("VisualStudioPreview/{}.", version))
+            {
                 Some(instance.installation_path()?)
             } else {
                 None
@@ -423,7 +414,7 @@ mod impl_ {
         };
 
         let vswhere_output = Command::new(vswhere_path)
-            .args(&[
+            .args([
                 "-latest",
                 "-products",
                 "*",
@@ -506,7 +497,7 @@ mod impl_ {
     fn tool_from_vs15plus_instance(
         tool: &str,
         target: TargetArch<'_>,
-        instance_path: &PathBuf,
+        instance_path: &Path,
     ) -> Option<Tool> {
         let (root_path, bin_path, host_dylib_path, lib_path, alt_lib_path, include_path) =
             vs15plus_vc_paths(target, instance_path)?;
@@ -712,7 +703,7 @@ mod impl_ {
     }
 
     fn add_env(tool: &mut Tool, env: &str, paths: Vec<PathBuf>) {
-        let prev = env::var_os(env).unwrap_or(OsString::new());
+        let prev = env::var_os(env).unwrap_or_default();
         let prev = env::split_paths(&prev);
         let new = paths.into_iter().chain(prev);
         tool.env
@@ -815,8 +806,7 @@ mod impl_ {
         let dir = dirs
             .into_iter()
             .rev()
-            .filter(|dir| dir.join("um").join("x64").join("kernel32.lib").is_file())
-            .next()?;
+            .find(|dir| dir.join("um").join("x64").join("kernel32.lib").is_file())?;
         let version = dir.components().last().unwrap();
         let version = version.as_os_str().to_str().unwrap().to_string();
         Some((root.into(), version))
@@ -928,7 +918,7 @@ mod impl_ {
         for subkey in key.iter().filter_map(|k| k.ok()) {
             let val = subkey
                 .to_str()
-                .and_then(|s| s.trim_start_matches("v").replace('.', "").parse().ok());
+                .and_then(|s| s.trim_start_matches('v').replace('.', "").parse().ok());
             let val = match val {
                 Some(s) => s,
                 None => continue,
@@ -1046,7 +1036,7 @@ mod impl_ {
             env::split_paths(&install_dir)
                 .map(|p| p.join(tool))
                 .find(|p| p.exists())
-                .map(|path| Tool::with_family(path.into(), MSVC_FAMILY))
+                .map(|path| Tool::with_family(path, MSVC_FAMILY))
         };
 
         // Take the path of tool for the vc install directory.
@@ -1054,7 +1044,7 @@ mod impl_ {
             // Take the path of tool for the vs install directory.
             .or_else(|| get_tool(vs_install_dir))
             // Take the path of tool for the current path environment.
-            .or_else(|| env::var_os("PATH").and_then(|path| get_tool(path)))
+            .or_else(|| env::var_os("PATH").and_then(get_tool))
     }
 
     pub(super) fn find_msvc_15plus(_tool: &str, _target: TargetArch<'_>) -> Option<Tool> {
