@@ -1,6 +1,6 @@
 [package]
 name = "cc"
-version = "1.1.1"
+version = "1.1.2"
 authors = ["Alex Crichton <alex@alexcrichton.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-lang/cc-rs"
@@ -30,6 +30,9 @@ libc = { version = "0.2.62", default-features = false, optional = true }
 
 [features]
 parallel = ["dep:libc", "dep:jobserver", "dep:once_cell"]
+# This is a placeholder feature for people who incorrectly used `cc` with `features = ["jobserver"]`
+# so that they aren't broken. This has never enabled `parallel`, so we won't do that.
+jobserver = []
 
 [dev-dependencies]
 tempfile = "3"
