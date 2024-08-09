@@ -1,6 +1,6 @@
 [package]
 name = "cc"
-version = "1.0.105"
+version = "1.0.106"
 authors = ["Alex Crichton <alex@alexcrichton.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-lang/cc-rs"
@@ -17,7 +17,7 @@ categories = ["development-tools::build-utils"]
 # The binary target is only used by tests.
 exclude = ["/.github", "tests", "src/bin"]
 edition = "2018"
-rust-version = "1.63"
+rust-version = "1.67"
 
 [dependencies]
 jobserver = { version = "0.1.30", default-features = false, optional = true }
