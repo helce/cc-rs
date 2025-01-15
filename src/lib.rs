@@ -2206,6 +2206,10 @@ impl Build {
                             cmd.args.push("-mtune=elbrus-16c".into());
                         } else if target.starts_with("e2k2c3") {
                             cmd.args.push("-mtune=elbrus-2c3".into());
+                        } else if target.starts_with("e2k48c") {
+                            cmd.args.push("-mtune=elbrus-48c".into());
+                        } else if target.starts_with("e2k8v7") {
+                            cmd.args.push("-mtune=elbrus-8v7".into());
                         }
                     } else if target.ends_with("-freebsd") {
                         // FreeBSD only supports C++11 and above when compiling against libc++
