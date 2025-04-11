@@ -53,7 +53,7 @@ fn main() {
     let file = target.split('-').next().unwrap();
     let file = format!(
         "src/{}.{}",
-        file,
+        if target.contains("e2k") { "e2k" } else { file },
         if target.contains("msvc") { "asm" } else { "S" }
     );
     cc::Build::new().file(file).compile("asm");
