@@ -547,7 +547,6 @@ impl Build {
     ///     .flag("unwanted_flag")
     ///     .remove_flag("unwanted_flag");
     /// ```
-
     pub fn remove_flag(&mut self, flag: &str) -> &mut Build {
         self.flags.retain(|other_flag| &**other_flag != flag);
         self
@@ -680,7 +679,7 @@ impl Build {
         let mut cmd = compiler.to_command();
         let is_arm = target.contains("aarch64") || target.contains("arm");
         let clang = compiler.is_like_clang();
-        let gnu = compiler.family == ToolFamily::Gnu;
+        let gnu = compiler.family.is_gnu();
         command_add_output_file(
             &mut cmd,
             &obj,
@@ -1686,7 +1685,7 @@ impl Build {
         let msvc = target.contains("msvc");
         let compiler = self.try_get_compiler()?;
         let clang = compiler.is_like_clang();
-        let gnu = compiler.family == ToolFamily::Gnu;
+        let gnu = compiler.family.is_gnu();
 
         let is_assembler_msvc = msvc && asm_ext == Some(AsmFileExt::DotAsm);
         let (mut cmd, name) = if is_assembler_msvc {
@@ -1850,7 +1849,7 @@ impl Build {
         if let Some(ref std) = self.std {
             let separator = match cmd.family {
                 ToolFamily::Msvc { .. } => ':',
-                ToolFamily::Gnu | ToolFamily::Clang { .. } => '=',
+                ToolFamily::Gnu { .. } | ToolFamily::Clang { .. } => '=',
             };
             cmd.push_cc_arg(format!("-std{}{}", separator, std).into());
         }
@@ -1946,7 +1945,7 @@ impl Build {
                     _ => {}
                 }
             }
-            ToolFamily::Gnu | ToolFamily::Clang { .. } => {
+            ToolFamily::Gnu { .. } | ToolFamily::Clang { .. } => {
                 // arm-linux-androideabi-gcc 4.8 shipped with Android NDK does
                 // not support '-Oz'
                 if opt_level == "z" && !cmd.is_like_clang() {
@@ -2285,7 +2284,7 @@ impl Build {
                         .push("-D_ARM_WINAPI_PARTITION_DESKTOP_SDK_AVAILABLE=1".into());
                 }
             }
-            ToolFamily::Gnu => {
+            ToolFamily::Gnu { .. } => {
                 if target.contains("darwin") {
                     if let Some(arch) = map_darwin_target_from_rust_to_compiler_architecture(target)
                     {
@@ -2491,7 +2490,8 @@ impl Build {
         if self.cpp {
             match (self.cpp_set_stdlib.as_ref(), cmd.family) {
                 (None, _) => {}
-                (Some(stdlib), ToolFamily::Gnu) | (Some(stdlib), ToolFamily::Clang { .. }) => {
+                (Some(stdlib), ToolFamily::Gnu { .. })
+                | (Some(stdlib), ToolFamily::Clang { .. }) => {
                     cmd.push_cc_arg(format!("-stdlib=lib{}", stdlib).into());
                 }
                 _ => {
@@ -3104,7 +3104,7 @@ impl Build {
             }
         }
 
-        if target.contains("msvc") && tool.family == ToolFamily::Gnu {
+        if target.contains("msvc") && tool.family.is_gnu() {
             self.cargo_output
                 .print_warning(&"GNU compiler is not supported for this target");
         }
@@ -3690,7 +3690,7 @@ impl Build {
             || target.contains("netbsd")
             || target.contains("openbsd")
             || target.contains("windows-gnu")
-            || (target.contains("e2k") && family == ToolFamily::Gnu)
+            || (target.contains("e2k") && family.is_gnu())
         {
             Some(2)
         } else if target.contains("linux") {
