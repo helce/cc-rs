@@ -189,7 +189,9 @@ impl Tool {
                 (true, _, _, _, false) | (_, _, _, true, false) => Ok(ToolFamily::Clang {
                     zig_cc: is_zig_cc(path, cargo_output),
                 }),
-                (false, false, true, _, false) | (_, _, _, _, true) => Ok(ToolFamily::Gnu { mcst_lcc }),
+                (false, false, true, _, false) | (_, _, _, _, true) => {
+                    Ok(ToolFamily::Gnu { mcst_lcc })
+                }
                 (false, false, false, false, false) => {
                     cargo_output.print_warning(&"Compiler family detection failed since it does not define `__clang__`, `__GNUC__`, `__EMSCRIPTEN__` or `__VXWORKS__`, also does not accept cl style flag `-?`, fallback to treating it as GNU");
                     Err(Error::new(
