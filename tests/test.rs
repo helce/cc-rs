@@ -72,6 +72,14 @@ fn gnu_debug() {
         .file("foo.c")
         .compile("foo");
     test.cmd(0).must_have("-gdwarf-2");
+
+    let test = Test::gnu();
+    test.gcc()
+        .target("e2k-unknown-linux-gnu")
+        .debug(true)
+        .file("foo.c")
+        .compile("foo");
+    test.cmd(0).must_have("-gdwarf-2");
 }
 
 #[test]
