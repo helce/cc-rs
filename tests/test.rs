@@ -59,7 +59,7 @@ fn gnu_opt_level_s() {
 fn gnu_debug() {
     let test = Test::gnu();
     test.gcc()
-        .target("x86_64-unknown-linux")
+        .target("x86_64-unknown-linux-none")
         .debug(true)
         .file("foo.c")
         .compile("foo");
@@ -78,7 +78,7 @@ fn gnu_debug() {
 fn gnu_debug_fp_auto() {
     let test = Test::gnu();
     test.gcc()
-        .target("x86_64-unknown-linux")
+        .target("x86_64-unknown-linux-none")
         .debug(true)
         .file("foo.c")
         .compile("foo");
@@ -90,7 +90,7 @@ fn gnu_debug_fp_auto() {
 fn gnu_debug_fp() {
     let test = Test::gnu();
     test.gcc()
-        .target("x86_64-unknown-linux")
+        .target("x86_64-unknown-linux-none")
         .debug(true)
         .file("foo.c")
         .compile("foo");
@@ -104,7 +104,7 @@ fn gnu_debug_nofp() {
 
     let test = Test::gnu();
     test.gcc()
-        .target("x86_64-unknown-linux")
+        .target("x86_64-unknown-linux-none")
         .debug(true)
         .force_frame_pointer(false)
         .file("foo.c")
@@ -114,7 +114,7 @@ fn gnu_debug_nofp() {
 
     let test = Test::gnu();
     test.gcc()
-        .target("x86_64-unknown-linux")
+        .target("x86_64-unknown-linux-none")
         .force_frame_pointer(false)
         .debug(true)
         .file("foo.c")
@@ -271,7 +271,7 @@ fn gnu_x86_64_no_plt() {
 
 #[test]
 fn gnu_aarch64_none_no_pic() {
-    for target in &["aarch64-unknown-none-gnu", "aarch64-unknown-none"] {
+    for target in &["aarch64-unknown-none-softfloat", "aarch64-unknown-none"] {
         let test = Test::gnu();
         test.gcc()
             .target(&target)
@@ -619,8 +619,7 @@ fn clang_apple_mac_catalyst() {
         .compile("foo");
     let execution = test.cmd(0);
 
-    // TODO: Add version to target here
-    execution.must_have("--target=arm64-apple-ios-macabi");
+    execution.must_have("--target=arm64-apple-ios15.0-macabi");
     execution.must_have_in_order("-isysroot", sdkroot);
     execution.must_have_in_order(
         "-isystem",

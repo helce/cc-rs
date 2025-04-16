@@ -19,12 +19,13 @@ jobs:
           git checkout -b regenerate-target-info-${{ github.run_id }}
 
       - name: Install rust
+        # Install both MSRV and current nightly
         run: |
-          rustup toolchain install stable nightly --no-self-update --profile minimal
+          rustup toolchain install 1.63 stable nightly --no-self-update --profile minimal
 
       - name: Create lockfile
         run: cargo update
-  
+
       - uses: Swatinem/rust-cache@v2
         with:
           cache-all-crates: 'true'
@@ -51,4 +52,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr create --base main --title "Update src/target_info.rs" --body "Automatically regenerated in CI"
+          gh pr create --base main --title "Update src/target/generated.rs" --body "Automatically regenerated in CI"
