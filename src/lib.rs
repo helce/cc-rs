@@ -2091,6 +2091,35 @@ impl Build {
                     // Pass `--target` with the LLVM target to properly
                     // configure Clang even when cross-compiling.
                     cmd.args.push(format!("--target={llvm_target}").into());
+
+                    // Set -march or -mtune for e2k targets.
+                    if target.full_arch == "e2kv3" {
+                        cmd.args.push("-march=elbrus-v3".into());
+                    } else if target.full_arch == "e2kv4" {
+                        cmd.args.push("-march=elbrus-v4".into());
+                    } else if target.full_arch == "e2kv5" {
+                        cmd.args.push("-march=elbrus-v5".into());
+                    } else if target.full_arch == "e2kv6" {
+                        cmd.args.push("-march=elbrus-v6".into());
+                    } else if target.full_arch == "e2k4c" {
+                        cmd.args.push("-mtune=elbrus-4c".into());
+                    } else if target.full_arch == "e2k8c" {
+                        cmd.args.push("-mtune=elbrus-8c".into());
+                    } else if target.full_arch == "e2k1cplus" {
+                        cmd.args.push("-mtune=elbrus-1c+".into());
+                    } else if target.full_arch == "e2k8c2" {
+                        cmd.args.push("-mtune=elbrus-8c2".into());
+                    } else if target.full_arch == "e2k12c" {
+                        cmd.args.push("-mtune=elbrus-12c".into());
+                    } else if target.full_arch == "e2k16c" {
+                        cmd.args.push("-mtune=elbrus-16c".into());
+                    } else if target.full_arch == "e2k2c3" {
+                        cmd.args.push("-mtune=elbrus-2c3".into());
+                    } else if target.full_arch == "e2k48c" {
+                        cmd.args.push("-mtune=elbrus-48c".into());
+                    } else if target.full_arch == "e2k8v7" {
+                        cmd.args.push("-mtune=elbrus-8v7".into());
+                    }
                 }
             }
             ToolFamily::Msvc { clang_cl } => {
