@@ -5,6 +5,7 @@ mod support;
 /// when run in parallel with them.
 #[test]
 #[cfg(not(windows))]
+#[cfg(not(target_arch = "e2k"))]
 fn inherits_rustflags() {
     // Sanity check - no flags
     std::env::set_var("CARGO_ENCODED_RUSTFLAGS", "");
