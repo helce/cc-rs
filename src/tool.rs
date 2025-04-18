@@ -103,6 +103,12 @@ impl Tool {
             )
             .map(|o| String::from_utf8_lossy(&o).contains("ziglang"))
             .unwrap_or_default()
+                || {
+                    match path.file_name().map(OsStr::to_string_lossy) {
+                        Some(fname) => fname.contains("zig"),
+                        _ => false,
+                    }
+                }
         }
 
         fn is_mcst_lcc(path: &Path, cargo_output: &CargoOutput) -> bool {
@@ -445,10 +451,8 @@ impl Tool {
 
     /// Supports using `--` delimiter to separate arguments and path to source files.
     pub(crate) fn supports_path_delimiter(&self) -> bool {
-        matches!(
-            self.family,
-            ToolFamily::Clang { .. } | ToolFamily::Msvc { clang_cl: true }
-        ) && !self.cuda
+        // homebrew clang and zig-cc does not support this while stock version does
+        matches!(self.family, ToolFamily::Msvc { clang_cl: true }) && !self.cuda
     }
 }
 
