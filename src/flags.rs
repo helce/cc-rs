@@ -174,7 +174,7 @@ impl RustcCodegenFlags {
         };
 
         match family {
-            ToolFamily::Clang { .. } | ToolFamily::Gnu => {
+            ToolFamily::Clang { .. } | ToolFamily::Gnu { .. } => {
                 // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-mbranch-protection
                 if let Some(value) = &self.branch_protection {
                     push_if_supported(
