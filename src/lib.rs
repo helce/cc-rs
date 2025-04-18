@@ -2137,7 +2137,7 @@ impl Build {
             } else if target.abi == "x32" {
                 cmd.args.push("-mx32".into());
             } else if target.os == "aix" {
-                if cmd.family == ToolFamily::Gnu {
+                if cmd.family.is_gnu() {
                     cmd.args.push("-maix64".into());
                 } else {
                     cmd.args.push("-m64".into());
