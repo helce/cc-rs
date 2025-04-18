@@ -2092,7 +2092,7 @@ impl Build {
 
                     // Pass `--target` with the LLVM target to properly
                     // configure Clang even when cross-compiling.
-                    cmd.args.push(format!("--target={llvm_target}").into());
+                    cmd.push_cc_arg(format!("--target={llvm_target}").into());
 
                     // Set -march or -mtune for e2k targets.
                     if target.full_arch == "e2kv3" {
