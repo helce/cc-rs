@@ -2094,6 +2094,26 @@ impl Build {
                         cmd.push_cc_arg("-pthread".into());
                     }
                 }
+
+                if target.os == "nto" {
+                    // Select the target with `-V`, see qcc documentation:
+                    // QNX 7.1: https://www.qnx.com/developers/docs/7.1/index.html#com.qnx.doc.neutrino.utilities/topic/q/qcc.html
+                    // QNX 8.0: https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.utilities/topic/q/qcc.html
+                    // This assumes qcc/q++ as compiler, which is currently the only supported compiler for QNX.
+                    // See for details: https://github.com/rust-lang/cc-rs/pull/1319
+                    let arg = match target.arch {
+                        "i586" => "-Vgcc_ntox86_cxx",
+                        "aarch64" => "-Vgcc_ntoaarch64le_cxx",
+                        "x86_64" => "-Vgcc_ntox86_64_cxx",
+                        _ => {
+                            return Err(Error::new(
+                                ErrorKind::InvalidTarget,
+                                format!("Unknown architecture for Neutrino QNX: {}", target.arch),
+                            ))
+                        }
+                    };
+                    cmd.push_cc_arg(arg.into());
+                }
             }
         }
 
@@ -2116,6 +2136,12 @@ impl Build {
                 cmd.args.push("-m32".into());
             } else if target.abi == "x32" {
                 cmd.args.push("-mx32".into());
+            } else if target.os == "aix" {
+                if cmd.family == ToolFamily::Gnu {
+                    cmd.args.push("-maix64".into());
+                } else {
+                    cmd.args.push("-m64".into());
+                }
             } else if target.arch == "x86_64" || target.arch == "powerpc64" {
                 cmd.args.push("-m64".into());
             }
@@ -2835,6 +2861,13 @@ impl Build {
                     format!("arm-kmc-eabi-{}", gnu)
                 } else if target.arch == "aarch64" && target.vendor == "kmc" {
                     format!("aarch64-kmc-elf-{}", gnu)
+                } else if target.os == "nto" {
+                    // See for details: https://github.com/rust-lang/cc-rs/pull/1319
+                    if self.cpp {
+                        "q++".to_string()
+                    } else {
+                        "qcc".to_string()
+                    }
                 } else if self.get_is_cross_compile()? {
                     let prefix = self.prefix_for_target(&raw_target);
                     match prefix {
