@@ -1165,7 +1165,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1177,7 +1177,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1189,7 +1189,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1201,7 +1201,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1213,7 +1213,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1225,7 +1225,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1237,7 +1237,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1249,7 +1249,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1261,7 +1261,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1273,7 +1273,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1285,7 +1285,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1297,7 +1297,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1309,7 +1309,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1321,7 +1321,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
@@ -1333,7 +1333,7 @@ pub(crate) const LIST: &[(&str, TargetInfo<'static>)] = &[
             os: "linux",
             env: "gnu",
             abi: "",
-            unversioned_llvm_target: "e2k-unknown-linux-gnu",
+            llvm_target: "e2k-unknown-linux-gnu",
         },
     ),
     (
