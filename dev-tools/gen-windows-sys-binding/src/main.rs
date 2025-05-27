@@ -30,7 +30,7 @@ fn main() {
     windows_bindgen::bindgen([
         "--flat",
         "--sys",
-        "--no-core",
+        "--no-deps",
         "--out",
         temp_file.path().to_str().unwrap(),
         "--filter",
@@ -68,7 +68,7 @@ fn main() {
         f.write_all("\n".as_bytes()).unwrap();
     }
 
-    f.write_all(r#"use super::windows_targets;"#.as_bytes())
+    f.write_all(r#"use super::windows_link;"#.as_bytes())
         .unwrap();
     f.write_all("\n".as_bytes()).unwrap();
 
