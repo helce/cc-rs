@@ -653,7 +653,12 @@ impl Build {
     /// ```
     ///
     pub fn try_flags_from_environment(&mut self, environ_key: &str) -> Result<&mut Build, Error> {
-        let flags = self.envflags(environ_key)?;
+        let flags = self.envflags(environ_key)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::EnvVarNotFound,
+                format!("could not find environment variable {environ_key}"),
+            )
+        })?;
         self.flags.extend(
             flags
                 .into_iter()
@@ -1594,8 +1599,8 @@ impl Build {
 
         if objs.len() <= 1 {
             for obj in objs {
-                let (mut cmd, name) = self.create_compile_object_cmd(obj)?;
-                run(&mut cmd, &name, &self.cargo_output)?;
+                let mut cmd = self.create_compile_object_cmd(obj)?;
+                run(&mut cmd, &self.cargo_output)?;
             }
 
             return Ok(());
@@ -1623,12 +1628,8 @@ impl Build {
         // acquire the appropriate tokens, Once all objects have been compiled
         // we wait on all the processes and propagate the results of compilation.
 
-        let pendings = Cell::new(Vec::<(
-            Command,
-            Cow<'static, Path>,
-            KillOnDrop,
-            parallel::job_token::JobToken,
-        )>::new());
+        let pendings =
+            Cell::new(Vec::<(Command, KillOnDrop, parallel::job_token::JobToken)>::new());
         let is_disconnected = Cell::new(false);
         let has_made_progress = Cell::new(false);
 
@@ -1649,14 +1650,8 @@ impl Build {
 
                 cell_update(&pendings, |mut pendings| {
                     // Try waiting on them.
-                    pendings.retain_mut(|(cmd, program, child, _token)| {
-                        match try_wait_on_child(
-                            cmd,
-                            program,
-                            &mut child.0,
-                            &mut stdout,
-                            &mut child.1,
-                        ) {
+                    pendings.retain_mut(|(cmd, child, _token)| {
+                        match try_wait_on_child(cmd, &mut child.0, &mut stdout, &mut child.1) {
                             Ok(Some(())) => {
                                 // Task done, remove the entry
                                 has_made_progress.set(true);
@@ -1695,14 +1690,14 @@ impl Build {
         };
         let spawn_future = async {
             for obj in objs {
-                let (mut cmd, program) = self.create_compile_object_cmd(obj)?;
+                let mut cmd = self.create_compile_object_cmd(obj)?;
                 let token = tokens.acquire().await?;
-                let mut child = spawn(&mut cmd, &program, &self.cargo_output)?;
+                let mut child = spawn(&mut cmd, &self.cargo_output)?;
                 let mut stderr_forwarder = StderrForwarder::new(&mut child);
                 stderr_forwarder.set_non_blocking()?;
 
                 cell_update(&pendings, |mut pendings| {
-                    pendings.push((cmd, program, KillOnDrop(child, stderr_forwarder), token));
+                    pendings.push((cmd, KillOnDrop(child, stderr_forwarder), token));
                     pendings
                 });
 
@@ -1741,17 +1736,14 @@ impl Build {
         check_disabled()?;
 
         for obj in objs {
-            let (mut cmd, name) = self.create_compile_object_cmd(obj)?;
-            run(&mut cmd, &name, &self.cargo_output)?;
+            let mut cmd = self.create_compile_object_cmd(obj)?;
+            run(&mut cmd, &self.cargo_output)?;
         }
 
         Ok(())
     }
 
-    fn create_compile_object_cmd(
-        &self,
-        obj: &Object,
-    ) -> Result<(Command, Cow<'static, Path>), Error> {
+    fn create_compile_object_cmd(&self, obj: &Object) -> Result<Command, Error> {
         let asm_ext = AsmFileExt::from_path(&obj.src);
         let is_asm = asm_ext.is_some();
         let target = self.get_target()?;
@@ -1761,23 +1753,14 @@ impl Build {
         let gnu = compiler.family.is_gnu();
 
         let is_assembler_msvc = msvc && asm_ext == Some(AsmFileExt::DotAsm);
-        let (mut cmd, name) = if is_assembler_msvc {
-            let (cmd, name) = self.msvc_macro_assembler()?;
-            (cmd, Cow::Borrowed(Path::new(name)))
+        let mut cmd = if is_assembler_msvc {
+            self.msvc_macro_assembler()?
         } else {
             let mut cmd = compiler.to_command();
             for (a, b) in self.env.iter() {
                 cmd.env(a, b);
             }
-            (
-                cmd,
-                compiler
-                    .path
-                    .file_name()
-                    .ok_or_else(|| Error::new(ErrorKind::IOError, "Failed to get compiler path."))
-                    .map(PathBuf::from)
-                    .map(Cow::Owned)?,
-            )
+            cmd
         };
         let is_arm = matches!(target.arch, "aarch64" | "arm");
         command_add_output_file(
@@ -1817,7 +1800,7 @@ impl Build {
             self.fix_env_for_apple_os(&mut cmd)?;
         }
 
-        Ok((cmd, name))
+        Ok(cmd)
     }
 
     /// This will return a result instead of panicking; see [`Self::expand()`] for
@@ -1852,12 +1835,7 @@ impl Build {
 
         cmd.args(self.files.iter().map(std::ops::Deref::deref));
 
-        let name = compiler
-            .path
-            .file_name()
-            .ok_or_else(|| Error::new(ErrorKind::IOError, "Failed to get compiler path."))?;
-
-        run_output(&mut cmd, name, &self.cargo_output)
+        run_output(&mut cmd, &self.cargo_output)
     }
 
     /// Run the compiler, returning the macro-expanded version of the input files.
@@ -1934,7 +1912,8 @@ impl Build {
             cmd.args.push(directory.as_os_str().into());
         }
 
-        if let Ok(flags) = self.envflags(if self.cpp { "CXXFLAGS" } else { "CFLAGS" }) {
+        let flags = self.envflags(if self.cpp { "CXXFLAGS" } else { "CFLAGS" })?;
+        if let Some(flags) = &flags {
             for arg in flags {
                 cmd.push_cc_arg(arg.into());
             }
@@ -1945,12 +1924,12 @@ impl Build {
         // CFLAGS/CXXFLAGS, since those variables presumably already contain
         // the desired set of warnings flags.
 
-        if self.warnings.unwrap_or(!self.has_flags()) {
+        if self.warnings.unwrap_or(flags.is_none()) {
             let wflags = cmd.family.warnings_flags().into();
             cmd.push_cc_arg(wflags);
         }
 
-        if self.extra_warnings.unwrap_or(!self.has_flags()) {
+        if self.extra_warnings.unwrap_or(flags.is_none()) {
             if let Some(wflags) = cmd.family.extra_warnings_flags() {
                 cmd.push_cc_arg(wflags.into());
             }
@@ -2500,13 +2479,7 @@ impl Build {
         Ok(())
     }
 
-    fn has_flags(&self) -> bool {
-        let flags_env_var_name = if self.cpp { "CXXFLAGS" } else { "CFLAGS" };
-        let flags_env_var_value = self.getenv_with_target_prefixes(flags_env_var_name);
-        flags_env_var_value.is_ok()
-    }
-
-    fn msvc_macro_assembler(&self) -> Result<(Command, &'static str), Error> {
+    fn msvc_macro_assembler(&self) -> Result<Command, Error> {
         let target = self.get_target()?;
         let tool = if target.arch == "x86_64" {
             "ml64.exe"
@@ -2561,7 +2534,7 @@ impl Build {
             cmd.arg("-safeseh");
         }
 
-        Ok((cmd, tool))
+        Ok(cmd)
     }
 
     fn assemble(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
@@ -2589,7 +2562,7 @@ impl Build {
             let dlink = out_dir.join(lib_name.to_owned() + "_dlink.o");
             let mut nvcc = self.get_compiler().to_command();
             nvcc.arg("--device-link").arg("-o").arg(&dlink).arg(dst);
-            run(&mut nvcc, "nvcc", &self.cargo_output)?;
+            run(&mut nvcc, &self.cargo_output)?;
             self.assemble_progressive(dst, &[dlink.as_path()])?;
         }
 
@@ -2617,12 +2590,12 @@ impl Build {
             // Non-msvc targets (those using `ar`) need a separate step to add
             // the symbol table to archives since our construction command of
             // `cq` doesn't add it for us.
-            let (mut ar, cmd, _any_flags) = self.get_ar()?;
+            let mut ar = self.try_get_archiver()?;
 
             // NOTE: We add `s` even if flags were passed using $ARFLAGS/ar_flag, because `s`
             // here represents a _mode_, not an arbitrary flag. Further discussion of this choice
             // can be seen in https://github.com/rust-lang/cc-rs/pull/763.
-            run(ar.arg("s").arg(dst), &cmd, &self.cargo_output)?;
+            run(ar.arg("s").arg(dst), &self.cargo_output)?;
         }
 
         Ok(())
@@ -2631,7 +2604,7 @@ impl Build {
     fn assemble_progressive(&self, dst: &Path, objs: &[&Path]) -> Result<(), Error> {
         let target = self.get_target()?;
 
-        let (mut cmd, program, any_flags) = self.get_ar()?;
+        let (mut cmd, program, any_flags) = self.try_get_archiver_and_flags()?;
         if target.env == "msvc" && !program.to_string_lossy().contains("llvm-ar") {
             // NOTE: -out: here is an I/O flag, and so must be included even if $ARFLAGS/ar_flag is
             // in use. -nologo on the other hand is just a regular flag, and one that we'll skip if
@@ -2649,7 +2622,7 @@ impl Build {
                 cmd.arg(dst);
             }
             cmd.args(objs);
-            run(&mut cmd, &program, &self.cargo_output)?;
+            run(&mut cmd, &self.cargo_output)?;
         } else {
             // Set an environment variable to tell the OSX archiver to ensure
             // that all dates listed in the archive are zero, improving
@@ -2678,11 +2651,7 @@ impl Build {
             // NOTE: We add cq here regardless of whether $ARFLAGS/ar_flag have been used because
             // it dictates the _mode_ ar runs in, which the setter of $ARFLAGS/ar_flag can't
             // dictate. See https://github.com/rust-lang/cc-rs/pull/763 for further discussion.
-            run(
-                cmd.arg("cq").arg(dst).args(objs),
-                &program,
-                &self.cargo_output,
-            )?;
+            run(cmd.arg("cq").arg(dst).args(objs), &self.cargo_output)?;
         }
 
         Ok(())
@@ -3144,10 +3113,6 @@ impl Build {
         }
     }
 
-    fn get_ar(&self) -> Result<(Command, PathBuf, bool), Error> {
-        self.try_get_archiver_and_flags()
-    }
-
     /// Get the archiver (ar) that's in use for this configuration.
     ///
     /// You can use [`Command::get_program`] to get just the path to the command.
@@ -3180,8 +3145,8 @@ impl Build {
     fn try_get_archiver_and_flags(&self) -> Result<(Command, PathBuf, bool), Error> {
         let (mut cmd, name) = self.get_base_archiver()?;
         let mut any_flags = false;
-        if let Ok(flags) = self.envflags("ARFLAGS") {
-            any_flags |= !flags.is_empty();
+        if let Some(flags) = self.envflags("ARFLAGS")? {
+            any_flags = true;
             cmd.args(flags);
         }
         for flag in &self.ar_flags {
@@ -3227,7 +3192,7 @@ impl Build {
     /// see [`Self::get_ranlib`] for the complete description.
     pub fn try_get_ranlib(&self) -> Result<Command, Error> {
         let mut cmd = self.get_base_ranlib()?;
-        if let Ok(flags) = self.envflags("RANLIBFLAGS") {
+        if let Some(flags) = self.envflags("RANLIBFLAGS")? {
             cmd.args(flags);
         }
         Ok(cmd)
@@ -3709,7 +3674,8 @@ impl Build {
         })
     }
 
-    fn getenv_with_target_prefixes(&self, var_base: &str) -> Result<Arc<OsStr>, Error> {
+    /// The list of environment variables to check for a given env, in order of priority.
+    fn target_envs(&self, env: &str) -> Result<[String; 4], Error> {
         let target = self.get_raw_target()?;
         let kind = if self.get_is_cross_compile()? {
             "TARGET"
@@ -3717,33 +3683,55 @@ impl Build {
             "HOST"
         };
         let target_u = target.replace('-', "_");
+
+        Ok([
+            format!("{env}_{target}"),
+            format!("{env}_{target_u}"),
+            format!("{kind}_{env}"),
+            env.to_string(),
+        ])
+    }
+
+    /// Get a single-valued environment variable with target variants.
+    fn getenv_with_target_prefixes(&self, env: &str) -> Result<Arc<OsStr>, Error> {
+        // Take from first environment variable in the environment.
         let res = self
-            .getenv(&format!("{}_{}", var_base, target))
-            .or_else(|| self.getenv(&format!("{}_{}", var_base, target_u)))
-            .or_else(|| self.getenv(&format!("{}_{}", kind, var_base)))
-            .or_else(|| self.getenv(var_base));
+            .target_envs(env)?
+            .iter()
+            .filter_map(|env| self.getenv(env))
+            .next();
 
         match res {
             Some(res) => Ok(res),
             None => Err(Error::new(
                 ErrorKind::EnvVarNotFound,
-                format!("Could not find environment variable {}.", var_base),
+                format!("could not find environment variable {env}"),
             )),
         }
     }
 
-    fn envflags(&self, name: &str) -> Result<Vec<String>, Error> {
-        let env_os = self.getenv_with_target_prefixes(name)?;
-        let env = env_os.to_string_lossy();
+    /// Get values from CFLAGS-style environment variable.
+    fn envflags(&self, env: &str) -> Result<Option<Vec<String>>, Error> {
+        // Collect from all environment variables, in reverse order as in
+        // `getenv_with_target_prefixes` precedence (so that `CFLAGS_$TARGET`
+        // can override flags in `TARGET_CFLAGS`, which overrides those in
+        // `CFLAGS`).
+        let mut any_set = false;
+        let mut res = vec![];
+        for env in self.target_envs(env)?.iter().rev() {
+            if let Some(var) = self.getenv(env) {
+                any_set = true;
 
-        if self.get_shell_escaped_flags() {
-            Ok(Shlex::new(&env).collect())
-        } else {
-            Ok(env
-                .split_ascii_whitespace()
-                .map(ToString::to_string)
-                .collect())
+                let var = var.to_string_lossy();
+                if self.get_shell_escaped_flags() {
+                    res.extend(Shlex::new(&var));
+                } else {
+                    res.extend(var.split_ascii_whitespace().map(ToString::to_string));
+                }
+            }
         }
+
+        Ok(if any_set { Some(res) } else { None })
     }
 
     fn fix_env_for_apple_os(&self, cmd: &mut Command) -> Result<(), Error> {
@@ -3795,7 +3783,6 @@ impl Build {
                 .arg("--show-sdk-path")
                 .arg("--sdk")
                 .arg(sdk),
-            "xcrun",
             &self.cargo_output,
         )?;
 
@@ -3852,7 +3839,6 @@ impl Build {
                     .arg("--show-sdk-version")
                     .arg("--sdk")
                     .arg(sdk),
-                "xcrun",
                 &self.cargo_output,
             )
             .ok()?;
@@ -4023,7 +4009,6 @@ impl Build {
     ) -> Option<PathBuf> {
         let search_dirs = run_output(
             cc.arg("-print-search-dirs"),
-            "cc",
             // this doesn't concern the compilation so we always want to show warnings.
             cargo_output,
         )
