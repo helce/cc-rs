@@ -579,7 +579,7 @@ fn macos_cpp_minimums() {
         let deployment_arg = exec
             .args
             .iter()
-            .find_map(|arg| arg.strip_prefix("--target=x86_64-apple-macosx"))
+            .find_map(|arg| arg.strip_prefix("-mmacosx-version-min="))
             .expect("no deployment target argument was set");
 
         let mut deployment_parts = deployment_arg.split('.').map(|v| v.parse::<u32>().unwrap());
@@ -607,7 +607,7 @@ fn macos_cpp_minimums() {
         .compile("foo");
 
     // No C++ leaves it untouched
-    test.cmd(0).must_have("--target=x86_64-apple-macosx10.7");
+    test.cmd(0).must_have("-mmacosx-version-min=10.7");
 }
 
 #[cfg(target_os = "macos")]
@@ -622,7 +622,7 @@ fn clang_apple_tvos() {
         .file("foo.c")
         .compile("foo");
 
-    test.cmd(0).must_have("--target=arm64-apple-tvos9.0");
+    test.cmd(0).must_have("-mappletvos-version-min=9.0");
 }
 
 #[cfg(target_os = "macos")]
@@ -645,7 +645,8 @@ fn clang_apple_mac_catalyst() {
         .compile("foo");
     let execution = test.cmd(0);
 
-    execution.must_have("--target=arm64-apple-ios15.0-macabi");
+    execution.must_have("--target=arm64-apple-ios-macabi");
+    execution.must_have("-mtargetos=ios15.0-macabi");
     execution.must_have_in_order("-isysroot", sdkroot);
     execution.must_have_in_order(
         "-isystem",
@@ -675,7 +676,8 @@ fn clang_apple_tvsimulator() {
         .compile("foo");
 
     test.cmd(0)
-        .must_have("--target=x86_64-apple-tvos9.0-simulator");
+        .must_have("--target=x86_64-apple-tvos-simulator");
+    test.cmd(0).must_have("-mappletvsimulator-version-min=9.0");
 }
 
 #[cfg(target_os = "macos")]
@@ -699,7 +701,8 @@ fn clang_apple_visionos() {
 
     dbg!(test.cmd(0).args);
 
-    test.cmd(0).must_have("--target=arm64-apple-xros1.0");
+    test.cmd(0).must_have("--target=arm64-apple-xros");
+    test.cmd(0).must_have("-mtargetos=xros1.0");
     test.cmd(0).must_not_have("-mxros-version-min=1.0");
     test.cmd(0).must_not_have("-mxrsimulator-version-min=1.0");
 }
