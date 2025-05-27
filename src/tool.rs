@@ -115,7 +115,6 @@ impl Tool {
         fn is_mcst_lcc(path: &Path, cargo_output: &CargoOutput) -> bool {
             run_output(
                 Command::new(path).arg("--version"),
-                path,
                 // tool detection issues should always be shown as warnings
                 cargo_output,
             )
