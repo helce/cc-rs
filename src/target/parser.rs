@@ -171,6 +171,8 @@ fn parse_arch(full_arch: &str) -> Option<&str> {
         // https://github.com/Clever-ISA/Clever-ISA
         arch if arch.starts_with("clever") => "clever",
 
+        arch if arch.starts_with("e2k") => "e2k",
+
         "sparc" | "sparcv7" | "sparcv8" => "sparc",
         "sparc64" | "sparcv9" => "sparc64",
 
