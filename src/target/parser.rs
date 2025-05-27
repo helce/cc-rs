@@ -383,8 +383,6 @@ impl<'a> TargetInfo<'a> {
         let vendor = match vendor {
             // esp, esp32, esp32s2 etc.
             vendor if vendor.starts_with("esp") => "espressif",
-            // FIXME(madsmtm): https://github.com/rust-lang/rust/issues/131165
-            "openwrt" => "unknown",
             // FIXME(madsmtm): Badly named targets `*-linux-android*`,
             // "linux" makes no sense as the vendor name.
             "linux" if os == "android" || os == "androideabi" => "unknown",
@@ -479,13 +477,13 @@ mod tests {
         let (full_arch, _rest) = target.split_once('-').expect("target to have arch");
 
         let mut target = TargetInfo {
-            full_arch: full_arch.into(),
-            arch: "invalid-none-set".into(),
-            vendor: "invalid-none-set".into(),
-            os: "invalid-none-set".into(),
-            env: "invalid-none-set".into(),
+            full_arch,
+            arch: "invalid-none-set",
+            vendor: "invalid-none-set",
+            os: "invalid-none-set",
+            env: "invalid-none-set",
             // Not set in older Rust versions
-            abi: "".into(),
+            abi: "",
         };
 
         for cfg in cfgs.lines() {
