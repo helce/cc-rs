@@ -1333,7 +1333,7 @@ impl Build {
         let mut cmd = compiler.to_command();
         let is_arm = matches!(target.arch, "aarch64" | "arm");
         let clang = compiler.is_like_clang();
-        let gnu = compiler.family == ToolFamily::Gnu;
+        let gnu = compiler.family.is_gnu();
         command_add_output_file(
             &mut cmd,
             &obj,
