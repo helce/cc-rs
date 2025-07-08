@@ -223,6 +223,7 @@ fn parse_envabi(last_component: &str) -> Option<(&str, &str)> {
         "qnx800" => ("nto80", ""),
         "sgx" => ("sgx", ""),
         "threads" => ("threads", ""),
+        "mlibc" => ("mlibc", ""),
 
         // ABIs
         "abi64" => ("", "abi64"),
@@ -465,6 +466,7 @@ mod tests {
             "x86_64-foxkit-linux-musl",
             "arm-poky-linux-gnueabi",
             "x86_64-unknown-moturus",
+            "x86_64-unknown-managarm-mlibc",
         ];
 
         for target in targets {
