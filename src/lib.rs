@@ -3622,8 +3622,18 @@ impl Build {
                         "riscv64-unknown-elf",
                         "riscv-none-embed",
                     ]),
+                    "riscv32im-unknown-none-elf" => self.find_working_gnu_prefix(&[
+                        "riscv32-unknown-elf",
+                        "riscv64-unknown-elf",
+                        "riscv-none-embed",
+                    ]),
                     "riscv32imac-esp-espidf" => Some("riscv32-esp-elf"),
                     "riscv32imac-unknown-none-elf" => self.find_working_gnu_prefix(&[
+                        "riscv32-unknown-elf",
+                        "riscv64-unknown-elf",
+                        "riscv-none-embed",
+                    ]),
+                    "riscv32imafc-unknown-none-elf" => self.find_working_gnu_prefix(&[
                         "riscv32-unknown-elf",
                         "riscv64-unknown-elf",
                         "riscv-none-embed",
@@ -3650,6 +3660,7 @@ impl Build {
                         "riscv-none-embed",
                     ]),
                     "riscv64gc-unknown-linux-gnu" => Some("riscv64-linux-gnu"),
+                    "riscv64a23-unknown-linux-gnu" => Some("riscv64-linux-gnu"),
                     "riscv32gc-unknown-linux-gnu" => Some("riscv32-linux-gnu"),
                     "riscv64gc-unknown-linux-musl" => Some("riscv64-linux-musl"),
                     "riscv32gc-unknown-linux-musl" => Some("riscv32-linux-musl"),
