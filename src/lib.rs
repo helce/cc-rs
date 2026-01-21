@@ -1241,8 +1241,9 @@ impl Build {
         self
     }
 
-    /// Define whether metadata should be emitted for cargo to detect environment
-    /// changes that should trigger a rebuild.
+    /// Define whether metadata should be emitted for cargo to only trigger
+    /// rebuild when detected environment changes, by default build script is
+    /// always run on every compilation if no rerun cargo metadata is emitted.
     ///
     /// NOTE that cc does not emit metadata to detect changes for `PATH`, since it could
     /// be changed every comilation yet does not affect the result of compilation
@@ -1683,12 +1684,7 @@ impl Build {
         check_disabled()?;
 
         if objs.len() <= 1 {
-            for obj in objs {
-                let mut cmd = self.create_compile_object_cmd(obj)?;
-                run(&mut cmd, &self.cargo_output)?;
-            }
-
-            return Ok(());
+            return self.compile_objects_sequential(objs);
         }
 
         // Limit our parallelism globally with a jobserver.
@@ -1816,16 +1812,20 @@ impl Build {
         }
     }
 
-    #[cfg(not(feature = "parallel"))]
-    fn compile_objects(&self, objs: &[Object]) -> Result<(), Error> {
-        check_disabled()?;
-
+    fn compile_objects_sequential(&self, objs: &[Object]) -> Result<(), Error> {
         for obj in objs {
             let mut cmd = self.create_compile_object_cmd(obj)?;
             run(&mut cmd, &self.cargo_output)?;
         }
 
         Ok(())
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    fn compile_objects(&self, objs: &[Object]) -> Result<(), Error> {
+        check_disabled()?;
+
+        self.compile_objects_sequential(objs)
     }
 
     fn create_compile_object_cmd(&self, obj: &Object) -> Result<Command, Error> {
@@ -3575,6 +3575,7 @@ impl Build {
                     "i686-unknown-linux-musl" => Some("musl"),
                     "i686-unknown-netbsd" => Some("i486--netbsdelf"),
                     "loongarch64-unknown-linux-gnu" => Some("loongarch64-linux-gnu"),
+                    "m68k-unknown-linux-gnu" => Some("m68k-linux-gnu"),
                     "mips-unknown-linux-gnu" => Some("mips-linux-gnu"),
                     "mips-unknown-linux-musl" => Some("mips-linux-musl"),
                     "mipsel-unknown-linux-gnu" => Some("mipsel-linux-gnu"),
