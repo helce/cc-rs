@@ -76,6 +76,10 @@
 //!   trailing spaces. This compiler must understand the `-c` flag. For
 //!   certain `TARGET`s, it also is assumed to know about other flags (most
 //!   common is `-fPIC`).
+//!   ccache, distcc, sccache, icecc, cachepot and buildcache are supported,
+//!   for sccache, simply set `CC` to `sccache cc`.
+//!   For other custom `CC` wrapper, just set `CC_KNOWN_WRAPPER_CUSTOM`
+//!   to the custom wrapper used in `CC`.
 //! * `AR` - the `ar` (archiver) executable to use to build the static library.
 //! * `CRATE_CC_NO_DEFAULTS` - the default compiler flags may cause conflicts in
 //!   some cross compiling scenarios. Setting this variable
@@ -95,7 +99,12 @@
 //!   dependencies. Note that operations that return [`Tool`]s such as
 //!   [`Build::get_compiler`] may produce less accurate results as in some cases `cc` runs
 //!   commands in order to locate compilers. Additionally, this does nothing to prevent
-//!   users from running [`Tool::to_command`] and executing the [`Command`] themselves.//!
+//!   users from running [`Tool::to_command`] and executing the [`Command`] themselves.
+//! * `RUSTC_WRAPPER` - If set, the specified command will be prefixed to the compiler
+//!   command. This is useful for projects that want to use
+//!   [sccache](https://github.com/mozilla/sccache),
+//!   [buildcache](https://gitlab.com/bits-n-bites/buildcache), or
+//!   [cachepot](https://github.com/paritytech/cachepot).
 //!
 //! Furthermore, projects using this crate may specify custom environment variables
 //! to be inspected, for example via the `Build::try_flags_from_environment`
@@ -215,6 +224,15 @@
 //!     .file("bar.cu")
 //!     .compile("bar");
 //! ```
+//!
+//! # Speed up compilation with sccache
+//!
+//! `cc-rs` does not handle incremental compilation like `make` or `ninja`. It
+//! always compiles the all sources, no matter if they have changed or not.
+//! This would be time-consuming in large projects. To save compilation time,
+//! you can use [sccache](https://github.com/mozilla/sccache) by setting
+//! environment variable `RUSTC_WRAPPER=sccache`, which will use cached `.o`
+//! files if the sources are unchanged.
 
 #![doc(html_root_url = "https://docs.rs/cc/1.0")]
 #![deny(warnings)]
@@ -300,6 +318,7 @@ pub struct Build {
     files: Vec<Arc<Path>>,
     cpp: bool,
     cpp_link_stdlib: Option<Option<Arc<str>>>,
+    cpp_link_stdlib_static: bool,
     cpp_set_stdlib: Option<Arc<str>>,
     cuda: bool,
     cudart: Option<Arc<str>>,
@@ -432,6 +451,7 @@ impl Build {
             static_flag: None,
             cpp: false,
             cpp_link_stdlib: None,
+            cpp_link_stdlib_static: false,
             cpp_set_stdlib: None,
             cuda: false,
             cudart: None,
@@ -948,6 +968,27 @@ impl Build {
         cpp_link_stdlib: V,
     ) -> &mut Build {
         self.cpp_link_stdlib = Some(cpp_link_stdlib.into().map(Arc::from));
+        self
+    }
+
+    /// Force linker to statically link C++ stdlib. By default cc-rs will emit
+    /// rustc-link flag to link against system C++ stdlib (e.g. libstdc++.so, libc++.so)
+    /// Provide value of `true` if linking against system library is not desired
+    ///
+    /// Note that for `wasm32` target C++ stdlib will always be linked statically
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// cc::Build::new()
+    ///     .file("src/foo.cpp")
+    ///     .cpp(true)
+    ///     .cpp_link_stdlib("stdc++")
+    ///     .cpp_link_stdlib_static(true)
+    ///     .compile("foo");
+    /// ```
+    pub fn cpp_link_stdlib_static(&mut self, is_static: bool) -> &mut Build {
+        self.cpp_link_stdlib_static = is_static;
         self
     }
 
@@ -1482,8 +1523,15 @@ impl Build {
         // Add specific C++ libraries, if enabled.
         if self.cpp {
             if let Some(stdlib) = self.get_cpp_link_stdlib()? {
-                self.cargo_output
-                    .print_metadata(&format_args!("cargo:rustc-link-lib={}", stdlib.display()));
+                if self.cpp_link_stdlib_static {
+                    self.cargo_output.print_metadata(&format_args!(
+                        "cargo:rustc-link-lib=static={}",
+                        stdlib.display()
+                    ));
+                } else {
+                    self.cargo_output
+                        .print_metadata(&format_args!("cargo:rustc-link-lib={}", stdlib.display()));
+                }
             }
             // Link c++ lib from WASI sysroot
             if target.arch == "wasm32" {
