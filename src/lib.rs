@@ -261,11 +261,82 @@ use shlex::Shlex;
 #[cfg(feature = "parallel")]
 mod parallel;
 mod target;
-mod windows;
 use self::target::*;
-// Regardless of whether this should be in this crate's public API,
-// it has been since 2015, so don't break it.
-pub use windows::find_tools as windows_registry;
+/// A helper module to looking for windows-specific tools:
+/// 1. On Windows host, probe the Windows Registry if needed;
+/// 2. On non-Windows host, check specified environment variables.
+pub mod windows_registry {
+    // Regardless of whether this should be in this crate's public API,
+    // it has been since 2015, so don't break it.
+
+    /// Attempts to find a tool within an MSVC installation using the Windows
+    /// registry as a point to search from.
+    ///
+    /// The `arch_or_target` argument is the architecture or the Rust target name
+    /// that the tool should work for (e.g. compile or link for). The supported
+    /// architecture names are:
+    /// - `"x64"` or `"x86_64"`
+    /// - `"arm64"` or `"aarch64"`
+    /// - `"arm64ec"`
+    /// - `"x86"`, `"i586"` or `"i686"`
+    /// - `"arm"` or `"thumbv7a"`
+    ///
+    /// The `tool` argument is the tool to find. Supported tools include:
+    /// - MSVC tools: `cl.exe`, `link.exe`, `lib.exe`, etc.
+    /// - `MSBuild`: `msbuild.exe`
+    /// - Visual Studio IDE: `devenv.exe`
+    /// - Clang/LLVM tools: `clang.exe`, `clang++.exe`, `clang-*.exe`, `llvm-*.exe`, `lld.exe`, etc.
+    ///
+    /// This function will return `None` if the tool could not be found, or it will
+    /// return `Some(cmd)` which represents a command that's ready to execute the
+    /// tool with the appropriate environment variables set.
+    ///
+    /// Note that this function always returns `None` for non-MSVC targets (if a
+    /// full target name was specified).
+    pub fn find(arch_or_target: &str, tool: &str) -> Option<std::process::Command> {
+        ::find_msvc_tools::find(arch_or_target, tool)
+    }
+
+    /// A version of Visual Studio
+    #[derive(Debug, PartialEq, Eq, Copy, Clone)]
+    #[non_exhaustive]
+    pub enum VsVers {
+        /// Visual Studio 12 (2013)
+        #[deprecated = "Visual Studio 12 is no longer supported. cc will never return this value."]
+        Vs12,
+        /// Visual Studio 14 (2015)
+        Vs14,
+        /// Visual Studio 15 (2017)
+        Vs15,
+        /// Visual Studio 16 (2019)
+        Vs16,
+        /// Visual Studio 17 (2022)
+        Vs17,
+    }
+
+    /// Find the most recent installed version of Visual Studio
+    ///
+    /// This is used by the cmake crate to figure out the correct
+    /// generator.
+    pub fn find_vs_version() -> Result<VsVers, String> {
+        ::find_msvc_tools::find_vs_version().map(|vers| match vers {
+            #[allow(deprecated)]
+            ::find_msvc_tools::VsVers::Vs12 => VsVers::Vs12,
+            ::find_msvc_tools::VsVers::Vs14 => VsVers::Vs14,
+            ::find_msvc_tools::VsVers::Vs15 => VsVers::Vs15,
+            ::find_msvc_tools::VsVers::Vs16 => VsVers::Vs16,
+            ::find_msvc_tools::VsVers::Vs17 => VsVers::Vs17,
+            _ => unreachable!("unknown VS version"),
+        })
+    }
+
+    /// Similar to the `find` function above, this function will attempt the same
+    /// operation (finding a MSVC tool in a local install) but instead returns a
+    /// [`Tool`](crate::Tool) which may be introspected.
+    pub fn find_tool(arch_or_target: &str, tool: &str) -> Option<crate::Tool> {
+        ::find_msvc_tools::find_tool(arch_or_target, tool).map(crate::Tool::from_find_msvc_tools)
+    }
+}
 
 mod command_helpers;
 use command_helpers::*;
@@ -351,6 +422,7 @@ pub struct Build {
     shell_escaped_flags: Option<bool>,
     build_cache: Arc<BuildCache>,
     inherit_rustflags: bool,
+    prefer_clang_cl_over_msvc: bool,
 }
 
 /// Represents the types of errors that may occur while using cc-rs.
@@ -479,6 +551,7 @@ impl Build {
             shell_escaped_flags: None,
             build_cache: Arc::default(),
             inherit_rustflags: true,
+            prefer_clang_cl_over_msvc: false,
         }
     }
 
@@ -1287,6 +1360,14 @@ impl Build {
     /// This option defaults to `true`.
     pub fn inherit_rustflags(&mut self, inherit_rustflags: bool) -> &mut Build {
         self.inherit_rustflags = inherit_rustflags;
+        self
+    }
+
+    /// Prefer to use clang-cl over msvc.
+    ///
+    /// This option defaults to `false`.
+    pub fn prefer_clang_cl_over_msvc(&mut self, prefer_clang_cl_over_msvc: bool) -> &mut Build {
+        self.prefer_clang_cl_over_msvc = prefer_clang_cl_over_msvc;
         self
     }
 
@@ -2638,7 +2719,7 @@ impl Build {
             _ => "ml.exe",
         };
         let mut cmd = self
-            .windows_registry_find(&target, tool)
+            .find_msvc_tools_find(&target, tool)
             .unwrap_or_else(|| self.cmd(tool));
         cmd.arg("-nologo"); // undocumented, yet working with armasm[64]
         for directory in self.include_directories.iter() {
@@ -2908,10 +2989,17 @@ impl Build {
         }
         let target = self.get_target()?;
         let raw_target = self.get_raw_target()?;
-        let (env, msvc, gnu, traditional, clang) = if self.cpp {
-            ("CXX", "cl.exe", "g++", "c++", "clang++")
+
+        let msvc = if self.prefer_clang_cl_over_msvc {
+            "clang-cl.exe"
         } else {
-            ("CC", "cl.exe", "gcc", "cc", "clang")
+            "cl.exe"
+        };
+
+        let (env, gnu, traditional, clang) = if self.cpp {
+            ("CXX", "g++", "c++", "clang++")
+        } else {
+            ("CC", "gcc", "cc", "clang")
         };
 
         // On historical Solaris systems, "cc" may have been Sun Studio, which
@@ -2924,7 +3012,7 @@ impl Build {
             traditional
         };
 
-        let cl_exe = self.windows_registry_find_tool(&target, "cl.exe");
+        let cl_exe = self.find_msvc_tools_find_tool(&target, msvc);
 
         let tool_opt: Option<Tool> = self
             .env_tool(env)
@@ -3450,7 +3538,7 @@ impl Build {
 
                     if lib.is_empty() {
                         name = PathBuf::from("lib.exe");
-                        let mut cmd = match self.windows_registry_find(&target, "lib.exe") {
+                        let mut cmd = match self.find_msvc_tools_find(&target, "lib.exe") {
                             Some(t) => t,
                             None => self.cmd("lib.exe"),
                         };
@@ -3816,7 +3904,12 @@ impl Build {
             self.cargo_output
                 .print_metadata(&format_args!("cargo:rerun-if-env-changed={v}"));
         }
-        let r = env::var_os(v).map(Arc::from);
+        let r = self
+            .env
+            .iter()
+            .find(|(k, _)| k.as_ref() == v)
+            .map(|(_, value)| value.clone())
+            .or_else(|| env::var_os(v).map(Arc::from));
         self.cargo_output.print_metadata(&format_args!(
             "{} = {}",
             v,
@@ -4217,17 +4310,17 @@ impl Build {
         None
     }
 
-    fn windows_registry_find(&self, target: &TargetInfo<'_>, tool: &str) -> Option<Command> {
-        self.windows_registry_find_tool(target, tool)
+    fn find_msvc_tools_find(&self, target: &TargetInfo<'_>, tool: &str) -> Option<Command> {
+        self.find_msvc_tools_find_tool(target, tool)
             .map(|c| c.to_command())
     }
 
-    fn windows_registry_find_tool(&self, target: &TargetInfo<'_>, tool: &str) -> Option<Tool> {
+    fn find_msvc_tools_find_tool(&self, target: &TargetInfo<'_>, tool: &str) -> Option<Tool> {
         struct BuildEnvGetter<'s>(&'s Build);
 
-        impl windows_registry::EnvGetter for BuildEnvGetter<'_> {
-            fn get_env(&self, name: &str) -> Option<windows_registry::Env> {
-                self.0.getenv(name).map(windows_registry::Env::Arced)
+        impl ::find_msvc_tools::EnvGetter for BuildEnvGetter<'_> {
+            fn get_env(&self, name: &str) -> Option<::find_msvc_tools::Env> {
+                self.0.getenv(name).map(::find_msvc_tools::Env::Arced)
             }
         }
 
@@ -4235,7 +4328,8 @@ impl Build {
             return None;
         }
 
-        windows_registry::find_tool_inner(target.full_arch, tool, &BuildEnvGetter(self))
+        ::find_msvc_tools::find_tool_with_env(target.full_arch, tool, &BuildEnvGetter(self))
+            .map(Tool::from_find_msvc_tools)
     }
 }
 
