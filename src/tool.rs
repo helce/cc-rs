@@ -595,7 +595,7 @@ impl ToolFamily {
     pub(crate) fn warnings_suppression_flags(&self) -> &'static str {
         match *self {
             ToolFamily::Msvc { .. } => "-W0",
-            ToolFamily::Gnu | ToolFamily::Clang { .. } => "-w",
+            ToolFamily::Gnu { .. } | ToolFamily::Clang { .. } => "-w",
         }
     }
 
