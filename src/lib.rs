@@ -2248,12 +2248,11 @@ impl Build {
                     // So instead, we pass the deployment target with `-m*-version-min=`, and only
                     // pass it here on visionOS and Mac Catalyst where that option does not exist:
                     // https://github.com/rust-lang/cc-rs/issues/1383
-                    let version =
-                        if target.os == "visionos" || target.get_apple_env() == Some(MacCatalyst) {
-                            Some(self.apple_deployment_target(target))
-                        } else {
-                            None
-                        };
+                    let version = if target.os == "visionos" || target.env == "macabi" {
+                        Some(self.apple_deployment_target(target))
+                    } else {
+                        None
+                    };
 
                     let clang_target =
                         target.llvm_target(&self.get_raw_target()?, version.as_deref());
@@ -2776,9 +2775,7 @@ impl Build {
         // https://github.com/llvm/llvm-project/issues/88271
         // And the workaround to use `-mtargetos=` cannot be used with the `--target` flag that we
         // otherwise specify. So we avoid emitting that, and put the version in `--target` instead.
-        if cmd.is_like_gnu()
-            || !(target.os == "visionos" || target.get_apple_env() == Some(MacCatalyst))
-        {
+        if cmd.is_like_gnu() || !(target.os == "visionos" || target.env == "macabi") {
             let min_version = self.apple_deployment_target(&target);
             cmd.args
                 .push(target.apple_version_flag(&min_version).into());
@@ -2798,7 +2795,7 @@ impl Build {
             cmd.env
                 .push(("SDKROOT".into(), OsStr::new(&sdk_path).to_owned()));
 
-            if target.get_apple_env() == Some(MacCatalyst) {
+            if target.env == "macabi" {
                 // Mac Catalyst uses the macOS SDK, but to compile against and
                 // link to iOS-specific frameworks, we should have the support
                 // library stubs in the include and library search path.
@@ -2841,6 +2838,14 @@ impl Build {
         cmd
     }
 
+    fn prefer_clang(&self) -> bool {
+        if let Some(env) = self.getenv("CARGO_ENCODED_RUSTFLAGS") {
+            env.to_string_lossy().contains("linker-plugin-lto")
+        } else {
+            false
+        }
+    }
+
     fn get_base_compiler(&self) -> Result<Tool, Error> {
         let out_dir = self.get_out_dir().ok();
         let out_dir = out_dir.as_deref();
@@ -2868,14 +2873,19 @@ impl Build {
             ("CC", "gcc", "cc", "clang")
         };
 
-        // On historical Solaris systems, "cc" may have been Sun Studio, which
-        // is not flag-compatible with "gcc".  This history casts a long shadow,
-        // and many modern illumos distributions today ship GCC as "gcc" without
-        // also making it available as "cc".
+        let fallback = Cow::Borrowed(Path::new(traditional));
         let default = if cfg!(target_os = "solaris") || cfg!(target_os = "illumos") {
-            gnu
+            // On historical Solaris systems, "cc" may have been Sun Studio, which
+            // is not flag-compatible with "gcc".  This history casts a long shadow,
+            // and many modern illumos distributions today ship GCC as "gcc" without
+            // also making it available as "cc".
+            Cow::Borrowed(Path::new(gnu))
+        } else if self.prefer_clang() {
+            self.which(Path::new(clang), None)
+                .map(Cow::Owned)
+                .unwrap_or(fallback)
         } else {
-            traditional
+            fallback
         };
 
         let cl_exe = self.find_msvc_tools_find_tool(&target, msvc);
@@ -2974,13 +2984,7 @@ impl Build {
                             let cc = if target.abi == "llvm" { clang } else { gnu };
                             format!("{prefix}-{cc}").into()
                         }
-                        None => {
-                            if raw_target == "xtensa-esp32s3-espidf" {
-                                "xtensa-esp32s3-elf".into()
-                            } else {
-                                default.into()
-                            }
-                        }
+                        None => default.into(),
                     }
                 } else {
                     default.into()
@@ -3623,6 +3627,12 @@ impl Build {
                         self.find_working_gnu_prefix(&["x86_64-linux-musl", "musl"])
                     }
                     "x86_64-unknown-netbsd" => Some("x86_64--netbsd"),
+                    "xtensa-esp32-espidf"
+                    | "xtensa-esp32-none-elf"
+                    | "xtensa-esp32s2-espidf"
+                    | "xtensa-esp32s2-none-elf"
+                    | "xtensa-esp32s3-espidf"
+                    | "xtensa-esp32s3-none-elf" => Some("xtensa-esp-elf"),
                     _ => None,
                 }
                 .map(Cow::Borrowed)
