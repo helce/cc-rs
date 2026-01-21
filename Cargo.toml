@@ -1,6 +1,6 @@
 [package]
 name = "cc"
-version = "1.2.38"
+version = "1.2.39"
 authors = ["Alex Crichton <alex@alexcrichton.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rust-lang/cc-rs"
@@ -44,7 +44,7 @@ members = [
     "dev-tools/cc-test",
     "dev-tools/gen-target-info",
     "dev-tools/gen-windows-sys-binding",
-    "dev-tools/wasm32-wasip1-threads-test",
+    "dev-tools/wasi-test",
 ]
 
 [patch.crates-io]

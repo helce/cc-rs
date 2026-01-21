@@ -2931,19 +2931,19 @@ impl Build {
         let tool = match tool_opt {
             Some(t) => t,
             None => {
-                let compiler = if cfg!(windows) && target.os == "windows" {
+                let compiler: PathBuf = if cfg!(windows) && target.os == "windows" {
                     if target.env == "msvc" {
-                        msvc.to_string()
+                        msvc.into()
                     } else {
                         let cc = if target.abi == "llvm" { clang } else { gnu };
-                        format!("{cc}.exe")
+                        format!("{cc}.exe").into()
                     }
                 } else if target.os == "ios"
                     || target.os == "watchos"
                     || target.os == "tvos"
                     || target.os == "visionos"
                 {
-                    clang.to_string()
+                    clang.into()
                 } else if target.os == "android" {
                     autodetect_android_compiler(&raw_target, gnu, clang)
                 } else if target.os == "cloudabi" {
@@ -2951,42 +2951,43 @@ impl Build {
                         "{}-{}-{}-{}",
                         target.full_arch, target.vendor, target.os, traditional
                     )
+                    .into()
+                } else if target.os == "wasi" {
+                    self.autodetect_wasi_compiler(&raw_target, clang)
                 } else if target.arch == "wasm32" || target.arch == "wasm64" {
                     // Compiling WASM is not currently supported by GCC, so
                     // let's default to Clang.
-                    clang.to_string()
+                    clang.into()
                 } else if target.os == "vxworks" {
-                    if self.cpp {
-                        "wr-c++".to_string()
-                    } else {
-                        "wr-cc".to_string()
-                    }
+                    if self.cpp { "wr-c++" } else { "wr-cc" }.into()
                 } else if target.arch == "arm" && target.vendor == "kmc" {
-                    format!("arm-kmc-eabi-{gnu}")
+                    format!("arm-kmc-eabi-{gnu}").into()
                 } else if target.arch == "aarch64" && target.vendor == "kmc" {
-                    format!("aarch64-kmc-elf-{gnu}")
+                    format!("aarch64-kmc-elf-{gnu}").into()
                 } else if target.os == "nto" {
                     // See for details: https://github.com/rust-lang/cc-rs/pull/1319
-                    if self.cpp {
-                        "q++".to_string()
-                    } else {
-                        "qcc".to_string()
-                    }
+                    if self.cpp { "q++" } else { "qcc" }.into()
                 } else if self.get_is_cross_compile()? {
                     let prefix = self.prefix_for_target(&raw_target);
                     match prefix {
                         Some(prefix) => {
                             let cc = if target.abi == "llvm" { clang } else { gnu };
-                            format!("{prefix}-{cc}")
+                            format!("{prefix}-{cc}").into()
                         }
-                        None => default.to_string(),
+                        None => {
+                            if raw_target == "xtensa-esp32s3-espidf" {
+                                "xtensa-esp32s3-elf".into()
+                            } else {
+                                default.into()
+                            }
+                        }
                     }
                 } else {
-                    default.to_string()
+                    default.into()
                 };
 
                 let mut t = Tool::new(
-                    PathBuf::from(compiler),
+                    compiler,
                     &self.build_cache.cached_compiler_family,
                     &self.cargo_output,
                     out_dir,
@@ -4197,6 +4198,28 @@ impl Build {
         ::find_msvc_tools::find_tool_with_env(target.full_arch, tool, &BuildEnvGetter(self))
             .map(Tool::from_find_msvc_tools)
     }
+
+    /// Compiling for WASI targets typically uses the [wasi-sdk] project and
+    /// installations of wasi-sdk are typically indicated with the
+    /// `WASI_SDK_PATH` environment variable. Check to see if that environment
+    /// variable exists, and check to see if an appropriate compiler is located
+    /// there. If that all passes then use that compiler by default, but
+    /// otherwise fall back to whatever the clang default is since gcc doesn't
+    /// have support for compiling to wasm.
+    ///
+    /// [wasi-sdk]: https://github.com/WebAssembly/wasi-sdk
+    fn autodetect_wasi_compiler(&self, raw_target: &str, clang: &str) -> PathBuf {
+        if let Some(path) = self.getenv("WASI_SDK_PATH") {
+            let target_clang = Path::new(&path)
+                .join("bin")
+                .join(format!("{raw_target}-clang"));
+            if let Some(path) = self.which(&target_clang, None) {
+                return path;
+            }
+        }
+
+        clang.into()
+    }
 }
 
 impl Default for Build {
@@ -4240,7 +4263,7 @@ fn android_clang_compiler_uses_target_arg_internally(clang_path: &Path) -> bool 
 }
 
 // FIXME: Use parsed target.
-fn autodetect_android_compiler(raw_target: &str, gnu: &str, clang: &str) -> String {
+fn autodetect_android_compiler(raw_target: &str, gnu: &str, clang: &str) -> PathBuf {
     let new_clang_key = match raw_target {
         "aarch64-linux-android" => Some("aarch64"),
         "armv7-linux-androideabi" => Some("armv7a"),
@@ -4285,6 +4308,7 @@ fn autodetect_android_compiler(raw_target: &str, gnu: &str, clang: &str) -> Stri
     } else {
         clang_compiler
     }
+    .into()
 }
 
 // Rust and clang/cc don't agree on how to name the target.
@@ -4357,9 +4381,8 @@ fn is_disabled() -> bool {
         0 => {
             let truth = compute_is_disabled();
             let encoded_truth = if truth { 2u8 } else { 1 };
-            // Might race against another thread, but we'd both be setting the
-            // same value so it should be fine.
-            CACHE.store(encoded_truth, Relaxed);
+            // Use compare_exchange to avoid race condition
+            let _ = CACHE.compare_exchange(0, encoded_truth, Relaxed, Relaxed);
             truth
         }
         _ => unreachable!(),
