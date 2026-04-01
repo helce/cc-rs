@@ -65,6 +65,7 @@ fn gnu_debug() {
         .must_have("-g")
         .must_not_have("-g1")
         .must_have("-gdwarf-2");
+    drop(test);
 
     let test = Test::gnu();
     test.gcc()

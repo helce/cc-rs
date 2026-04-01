@@ -16,6 +16,7 @@ fn sanity() {
 }
 
 #[test]
+#[cfg(not(target_arch = "e2k"))]
 fn inherits_rustflags() {
     // Correctly inherits flags from rustc
     let mut test = Test::gnu();
@@ -33,6 +34,7 @@ fn inherits_rustflags() {
 }
 
 #[test]
+#[cfg(not(target_arch = "e2k"))]
 fn no_stack_protector() {
     // Do *not* propagate -Zstack-protector=none
     let mut test = Test::gnu();

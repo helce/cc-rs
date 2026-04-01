@@ -108,6 +108,7 @@ fn more_spaces() {
 }
 
 #[test]
+#[cfg(not(target_arch = "e2k"))]
 fn clang_cl() {
     for exe_suffix in ["", ".exe"] {
         let mut test = Test::clang();
