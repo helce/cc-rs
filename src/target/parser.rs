@@ -447,6 +447,10 @@ impl<'a> TargetInfo<'a> {
             abi = "elfv2";
         }
 
+        if abi == "asan" {
+            abi = "";
+        }
+
         Ok(Self {
             full_arch,
             arch,
