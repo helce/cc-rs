@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 #![allow(clippy::disallowed_methods)]
 
 use std::env;
@@ -113,6 +114,7 @@ fn gnu_debug_fp_auto() {
         .compile("foo");
     test.cmd(0).must_have("-gdwarf-4");
     test.cmd(0).must_have("-fno-omit-frame-pointer");
+    test.cmd(0).must_have("-mno-omit-leaf-frame-pointer");
 }
 
 #[test]
@@ -125,6 +127,7 @@ fn gnu_debug_fp() {
         .compile("foo");
     test.cmd(0).must_have("-gdwarf-4");
     test.cmd(0).must_have("-fno-omit-frame-pointer");
+    test.cmd(0).must_have("-mno-omit-leaf-frame-pointer");
 }
 
 #[test]
@@ -138,6 +141,7 @@ fn gnu_debug_nofp() {
         .compile("foo");
     test.cmd(0).must_have("-gdwarf-4");
     test.cmd(0).must_not_have("-fno-omit-frame-pointer");
+    test.cmd(0).must_not_have("-mno-omit-leaf-frame-pointer");
     drop(test);
 
     let test = Test::gnu();
@@ -149,6 +153,7 @@ fn gnu_debug_nofp() {
         .compile("foo");
     test.cmd(0).must_have("-gdwarf-4");
     test.cmd(0).must_not_have("-fno-omit-frame-pointer");
+    test.cmd(0).must_not_have("-mno-omit-leaf-frame-pointer");
 }
 
 #[test]
@@ -587,8 +592,8 @@ fn gnu_apple_arch() {
         test.shim("fake-gcc")
             .gcc()
             .compiler("fake-gcc")
-            .target(&target)
-            .host(&"aarch64-apple-darwin")
+            .target(target)
+            .host("aarch64-apple-darwin")
             .file("foo.c")
             .compile("foo");
 
@@ -634,8 +639,8 @@ fn gnu_apple_deployment_target() {
         test.shim("fake-gcc")
             .gcc()
             .compiler("fake-gcc")
-            .target(&target)
-            .host(&"aarch64-apple-darwin")
+            .target(target)
+            .host("aarch64-apple-darwin")
             .file("foo.c")
             .compile("foo");
 

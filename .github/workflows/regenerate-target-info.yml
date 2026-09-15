@@ -21,7 +21,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: true
 
@@ -29,15 +29,17 @@ jobs:
         run: |
           git checkout -b regenerate-target-info-${{ github.run_id }}
 
+      - name: Get msrv
+        uses: ./.github/actions/get-msrv
+
       - name: Install rust
-        # Install both MSRV and current nightly
         run: |
-          rustup toolchain install 1.63 stable nightly --no-self-update --profile minimal
+          rustup toolchain install $MSRV stable nightly --no-self-update --profile minimal
 
       - name: Create lockfile
         run: cargo update
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-all-crates: 'true'
       - name: Regenerate target info

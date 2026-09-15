@@ -579,6 +579,7 @@ impl ToolFamily {
         match *self {
             ToolFamily::Gnu { .. } | ToolFamily::Clang { .. } => {
                 cmd.push_cc_arg("-fno-omit-frame-pointer".into());
+                cmd.push_cc_arg("-mno-omit-leaf-frame-pointer".into());
             }
             _ => (),
         }
