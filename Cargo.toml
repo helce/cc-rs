@@ -1,6 +1,6 @@
 [package]
 name = "cc"
-version = "1.4.2"
+version = "1.4.3"
 edition.workspace = true
 rust-version.workspace = true
 description = """
@@ -11,10 +11,10 @@ code.
 documentation = "https://docs.rs/cc"
 readme = "README.md"
 homepage = "https://github.com/rust-lang/cc-rs"
-repository = "https://github.com/rust-lang/cc-rs"
-license = "MIT OR Apache-2.0"
-keywords = ["build-dependencies"]
-categories = ["development-tools::build-utils"]
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 # The binary target is only used by tests.
 exclude = ["/.github", "src/bin", "tests"]
 
@@ -29,10 +29,26 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.64.0"
+rust-version = "1.65.0"
+repository = "https://github.com/rust-lang/cc-rs"
+license = "MIT OR Apache-2.0"
+keywords = ["build-dependencies"]
+categories = ["development-tools::build-utils"]
+
+[workspace.lints.clippy]
+borrow_as_ptr = "warn"
+disallowed_methods = "warn"
+doc_markdown = "warn"
+manual_let_else = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(disable_clang_cl_tests)'] }
 
 [dependencies]
-find-msvc-tools = { path = "find-msvc-tools", version = "0.1.10" }
+find-msvc-tools = { path = "find-msvc-tools", version = "0.1.11" }
 jobserver = { version = "0.1.30", default-features = false, optional = true }
 shlex = "2.0.1"
 
@@ -50,8 +66,8 @@ libc = { version = "0.2.168", default-features = false, optional = true }
 jobserver = []
 parallel = ["dep:jobserver", "dep:libc"]
 
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(disable_clang_cl_tests)'] }
+[lints]
+workspace = true
 
 [patch.crates-io]
 cc = { path = "." }
