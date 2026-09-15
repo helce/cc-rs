@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.66](https://github.com/rust-lang/cc-rs/compare/cc-v1.2.65...cc-v1.2.66) - 2026-07-05
+
+### Other
+
+- Fix target parsing for aarch64-unknown-linux-pauthtest ([#1779](https://github.com/rust-lang/cc-rs/pull/1779))
+- Support new QNX targets ([#1775](https://github.com/rust-lang/cc-rs/pull/1775))
+- Add kache to the supported compiler wrappers ([#1770](https://github.com/rust-lang/cc-rs/pull/1770))
+
 ## [1.2.65](https://github.com/rust-lang/cc-rs/compare/cc-v1.2.64...cc-v1.2.65) - 2026-06-19
 
 ### Other

@@ -74,7 +74,7 @@
 //!   wrapper via `sccache cc`. This compiler must understand the `-c` flag. For
 //!   certain `TARGET`s, it also is assumed to know about other flags (most
 //!   common is `-fPIC`).
-//!   ccache, distcc, sccache, icecc, cachepot and buildcache are supported,
+//!   ccache, distcc, sccache, icecc, cachepot, buildcache and kache are supported,
 //!   for sccache, simply set `CC` to `sccache cc`.
 //!   For other custom `CC` wrapper, just set `CC_KNOWN_WRAPPER_CUSTOM`
 //!   to the custom wrapper used in `CC`.
@@ -101,8 +101,9 @@
 //! * `RUSTC_WRAPPER` - If set, the specified command will be prefixed to the compiler
 //!   command. This is useful for projects that want to use
 //!   [sccache](https://github.com/mozilla/sccache),
-//!   [buildcache](https://gitlab.com/bits-n-bites/buildcache), or
-//!   [cachepot](https://github.com/paritytech/cachepot).
+//!   [buildcache](https://gitlab.com/bits-n-bites/buildcache),
+//!   [cachepot](https://github.com/paritytech/cachepot), or
+//!   [kache](https://github.com/kunobi-ninja/kache).
 //!
 //! Furthermore, projects using this crate may specify custom environment variables
 //! to be inspected, for example via the `Build::try_flags_from_environment`
@@ -2176,10 +2177,10 @@ impl Build {
                     }
                 }
 
-                if target.os == "nto" {
+                if target.os == "nto" || target.os == "qnx" {
                     // Select the target with `-V`, see qcc documentation:
-                    // QNX 7.1: https://www.qnx.com/developers/docs/7.1/index.html#com.qnx.doc.neutrino.utilities/topic/q/qcc.html
-                    // QNX 8.0: https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.utilities/topic/q/qcc.html
+                    // QNX SDP 7.1: https://www.qnx.com/developers/docs/7.1/index.html#com.qnx.doc.neutrino.utilities/topic/q/qcc.html
+                    // QNX SDP 8.0: https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.utilities/topic/q/qcc.html
                     // This assumes qcc/q++ as compiler, which is currently the only supported compiler for QNX.
                     // See for details: https://github.com/rust-lang/cc-rs/pull/1319
                     let arg = match target.full_arch {
@@ -3110,7 +3111,7 @@ impl Build {
                     format!("arm-kmc-eabi-{gnu}").into()
                 } else if target.arch == "aarch64" && target.vendor == "kmc" {
                     format!("aarch64-kmc-elf-{gnu}").into()
-                } else if target.os == "nto" {
+                } else if target.os == "nto" || target.os == "qnx" {
                     // See for details: https://github.com/rust-lang/cc-rs/pull/1319
                     if self.cpp { "q++" } else { "qcc" }.into()
                 } else if self.get_is_cross_compile()? {
@@ -3255,7 +3256,7 @@ impl Build {
         // No explicit CC wrapper was detected, but check if RUSTC_WRAPPER
         // is defined and is a build accelerator that is compatible with
         // C/C++ compilers (e.g. sccache)
-        const VALID_WRAPPERS: &[&str] = &["sccache", "cachepot", "buildcache"];
+        const VALID_WRAPPERS: &[&str] = &["sccache", "cachepot", "buildcache", "kache"];
 
         let rustc_wrapper = cargo_env_var_os("RUSTC_WRAPPER")?;
         let wrapper_path = Path::new(&rustc_wrapper);
@@ -3312,6 +3313,7 @@ impl Build {
             "icecc",
             "cachepot",
             "buildcache",
+            "kache",
         ];
         let custom_wrapper = self.get_env("CC_KNOWN_WRAPPER_CUSTOM");
         if custom_wrapper.is_some() {
@@ -3580,10 +3582,10 @@ impl Build {
                 } else if target.os == "vxworks" {
                     name = format!("wr-{tool}").into();
                     self.cmd(&name)
-                } else if target.os == "nto" {
+                } else if target.os == "nto" || target.os == "qnx" {
                     // Ref: https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.utilities/topic/a/ar.html
                     name = match target.full_arch {
-                        "i586" => format!("ntox86-{tool}").into(),
+                        "i686" | "i586" => format!("ntox86-{tool}").into(),
                         "x86" | "aarch64" | "x86_64" => {
                             format!("nto{}-{}", target.arch, tool).into()
                         }
