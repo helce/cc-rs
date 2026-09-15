@@ -2264,7 +2264,7 @@ impl Build {
 
         if self.get_force_frame_pointer() {
             let family = cmd.family;
-            if let ToolFamily::Gnu | ToolFamily::Clang { .. } = family {
+            if let ToolFamily::Gnu { .. } | ToolFamily::Clang { .. } = family {
                 cmd.push_cc_arg("-fno-omit-frame-pointer".into());
                 let flag = OsString::from("-mno-omit-leaf-frame-pointer");
                 if self
