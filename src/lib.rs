@@ -1520,9 +1520,17 @@ impl Build {
                 .debug(false)
                 .cpp(self.cpp)
                 .cuda(self.cuda)
+                .out_dir(&out_dir)
                 .inherit_rustflags(false)
                 .inherit_trim_paths(false)
                 .emit_rerun_if_env_changed(self.emit_rerun_if_env_changed);
+            // The probe has to see the environment the compiler is invoked in,
+            // or it answers a question about a different compiler than the one
+            // being built with: a bare compiler name resolves through this
+            // `PATH`, not the ambient one. Also share the caches, so that a
+            // compiler family already worked out is not worked out again.
+            cfg.env.clone_from(&self.env);
+            cfg.build_cache = Arc::clone(&self.build_cache);
             if let Some(target) = &self.target {
                 cfg.target(target);
             }
@@ -1544,6 +1552,7 @@ impl Build {
         }
 
         let mut cmd = compiler.to_command();
+        cmd.set_flag_supported_env(&self.env);
         command_add_output_file(
             &mut cmd,
             &obj,
@@ -1581,7 +1590,10 @@ impl Build {
             }
         }
 
-        let output = cmd.current_dir(out_dir).output()?;
+        cmd.current_dir(out_dir);
+        self.cargo_output
+            .print_debug(&format_args!("running: {cmd:?}"));
+        let output = cmd.output()?;
         let is_supported = output.status.success() && output.stderr.is_empty();
 
         self.build_cache
@@ -3200,6 +3212,7 @@ impl Build {
         if let Some(c) = &self.compiler {
             return Ok(Tool::new(
                 (**c).to_owned(),
+                &self.env,
                 &self.build_cache.cached_compiler_family,
                 &self.cargo_output,
                 out_dir,
@@ -3247,6 +3260,7 @@ impl Build {
                 let mut t = Tool::with_args(
                     tool,
                     args.clone(),
+                    &self.env,
                     &self.build_cache.cached_compiler_family,
                     &self.cargo_output,
                     out_dir,
@@ -3274,6 +3288,7 @@ impl Build {
                     } else {
                         Some(Tool::new(
                             PathBuf::from(tool),
+                            &self.env,
                             &self.build_cache.cached_compiler_family,
                             &self.cargo_output,
                             out_dir,
@@ -3339,6 +3354,7 @@ impl Build {
 
                 let mut t = Tool::new(
                     compiler,
+                    &self.env,
                     &self.build_cache.cached_compiler_family,
                     &self.cargo_output,
                     out_dir,
@@ -3363,6 +3379,7 @@ impl Build {
                 nvcc,
                 vec![],
                 self.cuda,
+                &self.env,
                 &self.build_cache.cached_compiler_family,
                 &self.cargo_output,
                 out_dir,
@@ -3750,7 +3767,13 @@ impl Build {
             None => {
                 if target.os == "android" {
                     name = format!("llvm-{tool}").into();
-                    match Command::new(&name).arg("--version").status() {
+                    // This probe decides which archiver the build uses, so it has
+                    // to run in the environment the build was configured with: a
+                    // bare name resolves through `Build::env`'s `PATH`, not the
+                    // ambient one.
+                    let mut probe = Command::new(&name);
+                    probe.arg("--version").set_ar_detection_env(&self.env);
+                    match probe.status() {
                         Ok(status) if status.success() => (),
                         _ => {
                             // FIXME: Use parsed target.
