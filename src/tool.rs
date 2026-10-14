@@ -667,7 +667,9 @@ mod tests {
     fn tool_env_wins_over_inherited_env() {
         let mut tool = Tool::with_family(
             "cc".into(),
-            ToolFamily::Gnu,
+            ToolFamily::Gnu {
+                mcst_lcc: false,
+            },
             EnvSnapshot::from_pairs(&[("CC_TEST_ORDER", "inherited")]),
         );
         tool.env.push(("CC_TEST_ORDER".into(), "tool".into()));
