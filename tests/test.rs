@@ -758,13 +758,11 @@ fn msvc_cpp_does_not_pass_tp_for_c_or_cpp() {
         .file(&cpp_src)
         .compile("foo");
 
-    test.cmd(0)
-        .must_have(&c_src)
+    test.cmd_for_source(&c_src)
         .must_not_have("-Tp")
         .must_not_have("/Tp")
         .must_not_have("-TP");
-    test.cmd(1)
-        .must_have(&cpp_src)
+    test.cmd_for_source(&cpp_src)
         .must_not_have("-Tp")
         .must_not_have("/Tp")
         .must_not_have("-TP");
@@ -799,9 +797,6 @@ fn msvc_warnings_disabled() {
     test.cmd(0).must_have("-W0").must_not_have("-W4");
 }
 
-// Disable this test with the parallel feature because the execution
-// order is not deterministic.
-#[cfg(not(feature = "parallel"))]
 #[test]
 fn asm_flags() {
     let test = Test::gnu();
@@ -811,9 +806,9 @@ fn asm_flags() {
         .file("x86_64.S")
         .asm_flag("--abc")
         .compile("foo");
-    test.cmd(0).must_not_have("--abc");
-    test.cmd(1).must_have("--abc");
-    test.cmd(2).must_have("--abc");
+    test.cmd_for_source("foo.c").must_not_have("--abc");
+    test.cmd_for_source("x86_64.asm").must_have("--abc");
+    test.cmd_for_source("x86_64.S").must_have("--abc");
 }
 
 #[test]
@@ -1417,6 +1412,465 @@ fn gnu_ar_probe_failure_no_warning() {
     );
 }
 
+/// Each line a compiler writes to stderr becomes exactly one warning, also
+/// when a failed compile's error is reported between them.
+///
+/// This test runs the builds in a subprocess so we
+/// can capture and assert on the emitted cargo metadata.
+#[test]
+fn compiler_stderr_forwarded_once_per_line() {
+    // When invoked as subprocess, perform the build and return.
+    if let Some(case) = env::var_os("__CC_TEST_STDERR_LINES") {
+        let test = Test::gnu();
+        let mut build = test.gcc();
+        build
+            .target("x86_64-unknown-linux-gnu")
+            .host("x86_64-unknown-linux-gnu")
+            .file("foo.c")
+            .file("bar.c")
+            .env("CC_SHIM_STDERR", "note: from the compiler");
+        if case == "compile-error" {
+            build.env("CC_SHIM_FAIL_IF_ARG", "-c");
+            build.try_compile("foo").unwrap_err();
+        } else {
+            build.compile("foo");
+        }
+        return;
+    }
+
+    let run = |case: &str| -> Vec<String> {
+        let output = Command::new(env::current_exe().unwrap())
+            .env("__CC_TEST_STDERR_LINES", case)
+            .env_remove("CC_ENABLE_DEBUG_OUTPUT")
+            .args([
+                "--exact",
+                "compiler_stderr_forwarded_once_per_line",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "subprocess failed: {:?}", output);
+        let stdout: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        for line in &stdout {
+            assert!(!line.contains('\0'), "{stdout:#?}");
+            assert!(
+                !line.get(1..).unwrap_or("").contains("cargo:"),
+                "{stdout:#?}"
+            );
+        }
+        stdout
+    };
+    let count = |lines: &[String], line: &str| lines.iter().filter(|l| *l == line).count();
+
+    let stdout = run("success");
+    assert_eq!(
+        count(&stdout, "cargo:warning=cc: note: from the compiler"),
+        2,
+        "{stdout:#?}"
+    );
+
+    let stdout = run("compile-error");
+    assert!(
+        count(&stdout, "cargo:warning=cc: simulated failure for arg '-c'") >= 1,
+        "{stdout:#?}"
+    );
+}
+
+/// A logger set with `message_logger` gets cc's warnings, each stderr line and
+/// failed commands, while every other `cargo:` line stays on stdout.
+///
+/// This test runs the builds in a subprocess so we
+/// can capture and assert on the emitted cargo metadata.
+#[test]
+fn message_logger() {
+    use std::{
+        any::Any,
+        io::Write,
+        panic::{RefUnwindSafe, UnwindSafe},
+        path::Path,
+        sync::{Arc, Mutex},
+    };
+
+    use cc::{BuildMessage, BuildMessageKind, BuildMessageLogger};
+
+    fn assert_auto_traits<T: Clone + Send + Sync + Unpin + UnwindSafe + RefUnwindSafe>() {}
+    assert_auto_traits::<cc::Build>();
+
+    /// Writes each message as `kind`, `extra` and the text, split by tabs.
+    struct FileLogger(Mutex<std::fs::File>);
+
+    impl BuildMessageLogger for FileLogger {
+        fn log(&self, kind: BuildMessageKind, msg: BuildMessage<'_>, extra: &dyn Any) {
+            let kind = match kind {
+                BuildMessageKind::CommandFailed {
+                    is_detection_cmd,
+                    exit_status,
+                    ..
+                } => {
+                    assert!(!exit_status.success());
+                    format!(
+                        "CommandFailed({:?}, {is_detection_cmd})",
+                        exit_status.code()
+                    )
+                }
+                kind => format!("{kind:?}"),
+            };
+            let extra = if let Some(cmd) = extra.downcast_ref::<Command>() {
+                let program = Path::new(cmd.get_program()).file_stem().unwrap();
+                program.to_str().unwrap().to_owned()
+            } else if extra.is::<()>() {
+                "()".to_owned()
+            } else {
+                panic!("unexpected extra for {kind}")
+            };
+            writeln!(self.0.lock().unwrap(), "{kind}\t{extra}\t{msg}").unwrap();
+        }
+    }
+
+    // When invoked as subprocess, perform the builds and return.
+    if let Some(case) = env::var_os("__CC_TEST_MESSAGE_LOGGER") {
+        let log =
+            std::fs::File::create(env::var_os("__CC_TEST_MESSAGE_LOGGER_FILE").unwrap()).unwrap();
+        let logger = Arc::new(FileLogger(Mutex::new(log)));
+        let test = if case == "msvc" {
+            Test::msvc()
+        } else {
+            Test::gnu()
+        };
+        let mut build = test.gcc();
+        if case != "msvc" {
+            build
+                .target("x86_64-unknown-linux-gnu")
+                .host("x86_64-unknown-linux-gnu");
+        }
+        build
+            .file("foo.c")
+            .file("bar.c")
+            // A line ending in `\r\n`, as compilers on Windows write them.
+            .env("CC_SHIM_STDERR", "note: from the compiler\r")
+            .message_logger(Some(logger.clone()));
+        match case.to_str().unwrap() {
+            "gnu" => {
+                // The flag check runs in a `Build` of its own.
+                build.flag_if_supported("-Wall").compile("foo");
+            }
+            "gnu-redirect" => {
+                // The flag check's warnings stay off stdout too.
+                build
+                    .flag_if_supported("-Wall")
+                    .cargo_warnings(false)
+                    .compile("foo");
+            }
+            "msvc" => {
+                // cc warns that `cl` can't set the C++ stdlib.
+                build.cpp(true).cpp_set_stdlib("c++").compile("foo");
+            }
+            "compile-error" => {
+                build.env("CC_SHIM_FAIL_IF_ARG", "-c");
+                assert!(build.try_compile("foo").is_err());
+            }
+            "clone-and-remove" => {
+                build.clone().compile("foo");
+                build.message_logger(None).compile("bar");
+            }
+            "expand" => {
+                // `expand` collects the compiler's output instead of streaming it.
+                let mut build = test.gcc();
+                build
+                    .target("x86_64-unknown-linux-gnu")
+                    .host("x86_64-unknown-linux-gnu")
+                    .file("foo.c")
+                    .message_logger(Some(logger));
+                assert!(build.try_expand().is_err());
+            }
+            "search-dirs" => {
+                // cc asks clang for its search dirs to find `llvm-ar`, and
+                // falls back to `ar` when that fails.
+                test.shim("clang");
+                let mut build = test.gcc();
+                build
+                    .target("wasm32-unknown-unknown")
+                    .host("x86_64-unknown-linux-gnu")
+                    .env("CC_SHIM_FAIL_IF_ARG", "--print-search-dirs")
+                    .message_logger(Some(logger));
+                assert!(build.try_get_archiver().is_ok());
+            }
+            "family-detection-debug" => {
+                // The shim fails the `-E` that family detection runs.
+                let mut build = test.gcc();
+                build
+                    .target("x86_64-unknown-linux-gnu")
+                    .host("x86_64-unknown-linux-gnu")
+                    .cargo_debug(true)
+                    .message_logger(Some(logger));
+                assert!(build.try_get_compiler().is_ok());
+            }
+            "xcrun" => {
+                // For iOS cc asks `xcrun` for the SDK version, which it can
+                // do without, and for the SDK path, which it can't.
+                test.shim("clang").shim("xcrun");
+                for arg in ["--show-sdk-version", "--show-sdk-path"] {
+                    let mut build = test.gcc();
+                    build
+                        .target("aarch64-apple-ios")
+                        .host("x86_64-unknown-linux-gnu")
+                        .env("CC_SHIM_FAIL_IF_ARG", arg)
+                        .message_logger(Some(logger.clone()));
+                    assert_eq!(
+                        build.try_get_compiler().is_ok(),
+                        arg == "--show-sdk-version"
+                    );
+                }
+            }
+            case => panic!("unknown case {case}"),
+        }
+        return;
+    }
+
+    let run = |case: &str| -> (Vec<String>, Vec<[String; 3]>) {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let log = dir.path().join("cc.log");
+        let mut cmd = Command::new(env::current_exe().unwrap());
+        cmd.env("__CC_TEST_MESSAGE_LOGGER", case)
+            .env_remove("CC_ENABLE_DEBUG_OUTPUT")
+            .env("__CC_TEST_MESSAGE_LOGGER_FILE", &log)
+            .args(["--exact", "message_logger", "--nocapture"]);
+        // The `wasm32` and iOS cases rely on cc's default compiler and
+        // archiver, and the iOS case on asking `xcrun`.
+        for target in ["wasm32-unknown-unknown", "aarch64-apple-ios"] {
+            for var in ["CC", "AR"] {
+                cmd.env_remove(format!("{var}_{target}"))
+                    .env_remove(format!("{var}_{}", target.replace('-', "_")));
+            }
+        }
+        cmd.env_remove("TARGET_CC")
+            .env_remove("TARGET_AR")
+            .env_remove("SDKROOT")
+            .env_remove("IPHONEOS_DEPLOYMENT_TARGET");
+        let output = cmd.output().unwrap();
+        assert!(output.status.success(), "subprocess failed: {:?}", output);
+        let stdout = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let messages = std::fs::read_to_string(&log).unwrap();
+        assert!(!messages.contains('\r'), "{messages:?}");
+        let messages = messages
+            .lines()
+            .map(|line| {
+                let mut parts = line.splitn(3, '\t').map(str::to_owned);
+                [(); 3].map(|()| parts.next().unwrap())
+            })
+            .collect();
+        (stdout, messages)
+    };
+    let warnings = |stdout: &[String]| -> Vec<String> {
+        stdout
+            .iter()
+            .filter_map(|line| line.strip_prefix("cargo:warning="))
+            .map(str::to_owned)
+            .collect()
+    };
+    let texts = |messages: &[[String; 3]]| -> Vec<String> {
+        messages.iter().map(|[_, _, text]| text.clone()).collect()
+    };
+    let count = |messages: &[[String; 3]], kind: &str, extra: &str, text: &str| {
+        messages
+            .iter()
+            .filter(|m| m[0] == kind && m[1] == extra && m[2] == text)
+            .count()
+    };
+    let assert_link_lines = |stdout: &[String]| {
+        assert!(
+            stdout
+                .iter()
+                .any(|l| l == "cargo:rustc-link-lib=static=foo"),
+            "{stdout:#?}"
+        );
+        assert!(
+            stdout
+                .iter()
+                .any(|l| l.starts_with("cargo:rustc-link-search=native=")),
+            "{stdout:#?}"
+        );
+    };
+    let stderr_line = "StderrForwarding";
+    let note = "cc: note: from the compiler";
+
+    // By default the logger mirrors the warnings.
+    let (stdout, messages) = run("gnu");
+    assert_eq!(warnings(&stdout), texts(&messages));
+    assert_eq!(
+        count(&messages, stderr_line, "cc", note),
+        2,
+        "{messages:#?}"
+    );
+    assert!(
+        count(&messages, stderr_line, "ar", "ar: note: from the compiler") >= 1,
+        "{messages:#?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|m| m[0] == stderr_line || (m[0] == "GeneralWarning" && m[1] == "()")),
+        "{messages:#?}"
+    );
+    assert_link_lines(&stdout);
+
+    // With cargo warnings off, the messages only go to the logger.
+    let (stdout, messages) = run("gnu-redirect");
+    assert_eq!(warnings(&stdout), Vec::<String>::new());
+    assert_eq!(
+        count(&messages, stderr_line, "cc", note),
+        2,
+        "{messages:#?}"
+    );
+    assert_link_lines(&stdout);
+
+    // cc's own warnings are general warnings.
+    let (stdout, messages) = run("msvc");
+    assert_eq!(warnings(&stdout), texts(&messages));
+    assert!(
+        messages
+            .iter()
+            .any(|[kind, extra, text]| kind == "GeneralWarning"
+                && extra == "()"
+                && text.contains("cpp_set_stdlib is specified")),
+        "{messages:#?}"
+    );
+    assert_link_lines(&stdout);
+
+    // A failed compile's diagnostics come before the failed command.
+    let (_, messages) = run("compile-error");
+    let failed = messages
+        .iter()
+        .position(|[kind, extra, text]| {
+            kind == "CommandFailed(Some(1), false)"
+                && extra == "cc"
+                && text.starts_with("command did not execute successfully")
+        })
+        .unwrap_or_else(|| panic!("{messages:#?}"));
+    assert!(
+        count(
+            &messages[..failed],
+            stderr_line,
+            "cc",
+            "cc: simulated failure for arg '-c'"
+        ) >= 1,
+        "{messages:#?}"
+    );
+    // With `parallel`, the error isn't passed a second time as a warning.
+    assert!(
+        messages
+            .iter()
+            .all(|m| m[0] != "GeneralWarning" || !m[2].contains(&messages[failed][2])),
+        "{messages:#?}"
+    );
+
+    // Output that cc collects reaches the logger too.
+    let (_, messages) = run("expand");
+    let failed = messages
+        .iter()
+        .position(|[kind, extra, _]| kind == "CommandFailed(Some(1), false)" && extra == "cc")
+        .unwrap_or_else(|| panic!("{messages:#?}"));
+    assert_eq!(
+        count(
+            &messages[..failed],
+            stderr_line,
+            "cc",
+            "cc: the shim cannot preprocess"
+        ),
+        1,
+        "{messages:#?}"
+    );
+
+    // A failed detection command is still reported, flagged as one.
+    let (_, messages) = run("search-dirs");
+    let failed: Vec<_> = messages
+        .iter()
+        .filter(|[kind, _, _]| kind.starts_with("CommandFailed"))
+        .collect();
+    assert_eq!(failed.len(), 1, "{messages:#?}");
+    let [kind, extra, text] = failed[0];
+    assert_eq!(
+        [kind.as_str(), extra.as_str()],
+        ["CommandFailed(Some(1), true)", "clang"],
+        "{messages:#?}"
+    );
+    assert!(text.contains("--print-search-dirs"), "{messages:#?}");
+    assert_eq!(
+        count(
+            &messages,
+            stderr_line,
+            "clang",
+            "clang: simulated failure for arg '--print-search-dirs'"
+        ),
+        1,
+        "{messages:#?}"
+    );
+
+    // Family detection reports its failures only with `cargo_debug`, and the
+    // shim makes its `-E` fail.
+    let (_, messages) = run("family-detection-debug");
+    let failed: Vec<_> = messages
+        .iter()
+        .filter(|[kind, _, _]| kind.starts_with("CommandFailed"))
+        .collect();
+    assert_eq!(failed.len(), 1, "{messages:#?}");
+    let [kind, extra, text] = failed[0];
+    assert_eq!(
+        [kind.as_str(), extra.as_str()],
+        ["CommandFailed(Some(1), true)", "cc"],
+        "{messages:#?}"
+    );
+    assert!(text.contains("\"-E\""), "{messages:#?}");
+
+    // cc goes on without the SDK version, but not without the SDK path.
+    let (_, messages) = run("xcrun");
+    let failed: Vec<_> = messages
+        .iter()
+        .filter(|[kind, _, _]| kind.starts_with("CommandFailed"))
+        .map(|[kind, extra, text]| {
+            let arg = ["--show-sdk-version", "--show-sdk-path"]
+                .into_iter()
+                .find(|arg| text.contains(arg));
+            (kind.as_str(), extra.as_str(), arg)
+        })
+        .collect();
+    assert_eq!(
+        failed,
+        [
+            (
+                "CommandFailed(Some(1), true)",
+                "xcrun",
+                Some("--show-sdk-version")
+            ),
+            (
+                "CommandFailed(Some(1), false)",
+                "xcrun",
+                Some("--show-sdk-path")
+            ),
+        ],
+        "{messages:#?}"
+    );
+
+    // Clones share the logger, and `None` removes it.
+    let (stdout, messages) = run("clone-and-remove");
+    assert_eq!(
+        count(&messages, stderr_line, "cc", note),
+        2,
+        "{messages:#?}"
+    );
+    assert_eq!(
+        warnings(&stdout).iter().filter(|w| *w == note).count(),
+        4,
+        "{stdout:#?}"
+    );
+}
+
 /// With `cpp_link_stdlib_static`, the C++ stdlib is emitted with `-bundle` once
 /// per `Build`, `wasm32`, `pauthtest` and Apple keep a plain `static=`, and a
 /// stdlib value that already names a link kind is emitted unchanged.
@@ -1553,4 +2007,774 @@ fn cpp_link_stdlib_static_metadata() {
         link_lib_lines("one-build", &[("CXXSTDLIB", "dylib=stdc++")]),
         ["static=foo", "dylib=stdc++", "static=bar", "static=baz"]
     );
+}
+
+/// The `CXXSTDLIB_STATIC` environment variable links the C++ stdlib statically
+/// for a `Build` that doesn't call `cpp_link_stdlib_static`, keeping its stdlib
+/// name.
+///
+/// This test runs the builds in a subprocess so we
+/// can capture and assert on the emitted cargo metadata.
+#[test]
+fn cxxstdlib_static_env_metadata() {
+    // When invoked as subprocess, perform the builds and return.
+    if let Some(case) = env::var_os("__CC_TEST_CXXSTDLIB_STATIC") {
+        let test = Test::gnu();
+        let mut build = test.gcc();
+        build
+            .target("x86_64-unknown-linux-gnu")
+            .host("x86_64-unknown-linux-gnu")
+            .cpp(true)
+            .cpp_link_stdlib("stdc++")
+            .file("foo.cpp")
+            .archiver(test.td.path().join("ar"));
+        match case.to_str().unwrap() {
+            "stdlib" => {}
+            "no-stdlib" => {
+                build.cpp_link_stdlib(None);
+            }
+            "static-false" => {
+                build.cpp_link_stdlib_static(false);
+            }
+            "x86_64-apple-darwin" => {
+                build.target("x86_64-apple-darwin").cpp_link_stdlib("c++");
+            }
+            case => panic!("unknown case {case}"),
+        }
+        build.compile("foo");
+        build.compile("bar");
+        return;
+    }
+
+    let metadata_lines = |case: &str, envs: &[(&str, &str)]| -> Vec<String> {
+        let output = Command::new(env::current_exe().unwrap())
+            .env("__CC_TEST_CXXSTDLIB_STATIC", case)
+            .env_remove("CXXSTDLIB")
+            .env_remove("CXXSTDLIB_STATIC")
+            .env_remove("HOST_CXXSTDLIB_STATIC")
+            .env_remove("TARGET_CXXSTDLIB_STATIC")
+            .env_remove("CXXSTDLIB_STATIC_x86_64-unknown-linux-gnu")
+            .env_remove("CXXSTDLIB_STATIC_x86_64_unknown_linux_gnu")
+            .env_remove("CXXSTDLIB_STATIC_x86_64-apple-darwin")
+            .env_remove("CXXSTDLIB_STATIC_x86_64_apple_darwin")
+            .envs(envs.iter().copied())
+            .args(["--exact", "cxxstdlib_static_env_metadata", "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "subprocess failed: {:?}", output);
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| {
+                line.starts_with("cargo:rustc-link-lib=")
+                    || (line.starts_with("cargo:rerun-if-env-changed=")
+                        && line.contains("CXXSTDLIB_STATIC"))
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    let link_lib_lines = |case: &str, envs: &[(&str, &str)]| -> Vec<String> {
+        metadata_lines(case, envs)
+            .iter()
+            .filter_map(|line| line.strip_prefix("cargo:rustc-link-lib="))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // Unset or false, nothing changes.
+    let dynamic = ["static=foo", "stdc++", "static=bar", "stdc++"];
+    assert_eq!(link_lib_lines("stdlib", &[]), dynamic);
+    for value in ["", "0", "no", "false"] {
+        assert_eq!(
+            link_lib_lines("stdlib", &[("CXXSTDLIB_STATIC", value)]),
+            dynamic
+        );
+    }
+    // Set, the crate's stdlib is linked statically, once per `Build`.
+    let static_once = ["static=foo", "static:-bundle=stdc++", "static=bar"];
+    for (key, value) in [
+        ("CXXSTDLIB_STATIC", "1"),
+        ("CXXSTDLIB_STATIC", "true"),
+        ("HOST_CXXSTDLIB_STATIC", "1"),
+        ("CXXSTDLIB_STATIC_x86_64-unknown-linux-gnu", "1"),
+        ("CXXSTDLIB_STATIC_x86_64_unknown_linux_gnu", "1"),
+    ] {
+        assert_eq!(link_lib_lines("stdlib", &[(key, value)]), static_once);
+    }
+    // It also overrides an explicit `cpp_link_stdlib_static(false)`.
+    assert_eq!(
+        link_lib_lines("static-false", &[("CXXSTDLIB_STATIC", "1")]),
+        static_once
+    );
+    // A target specific value takes precedence over the plain one.
+    assert_eq!(
+        link_lib_lines(
+            "stdlib",
+            &[
+                ("CXXSTDLIB_STATIC", "1"),
+                ("CXXSTDLIB_STATIC_x86_64_unknown_linux_gnu", "0")
+            ]
+        ),
+        dynamic
+    );
+    // No stdlib stays no stdlib.
+    assert_eq!(
+        link_lib_lines("no-stdlib", &[("CXXSTDLIB_STATIC", "1")]),
+        ["static=foo", "static=bar"]
+    );
+    // Apple keeps `static=`, as with `cpp_link_stdlib_static(true)`.
+    assert_eq!(
+        link_lib_lines("x86_64-apple-darwin", &[("CXXSTDLIB_STATIC", "1")]),
+        ["static=foo", "static=c++", "static=bar", "static=c++"]
+    );
+    // Cross compiling, the `TARGET_` prefixed form is read.
+    assert_eq!(
+        link_lib_lines("x86_64-apple-darwin", &[("TARGET_CXXSTDLIB_STATIC", "1")]),
+        ["static=foo", "static=c++", "static=bar", "static=c++"]
+    );
+    // Cargo reruns the build script when the variable changes.
+    let lines = metadata_lines("stdlib", &[]);
+    for key in [
+        "CXXSTDLIB_STATIC_x86_64-unknown-linux-gnu",
+        "CXXSTDLIB_STATIC_x86_64_unknown_linux_gnu",
+        "HOST_CXXSTDLIB_STATIC",
+        "CXXSTDLIB_STATIC",
+    ] {
+        assert!(
+            lines.contains(&format!("cargo:rerun-if-env-changed={key}")),
+            "missing rerun-if-env-changed for {key}: {lines:?}"
+        );
+    }
+}
+
+/// A clone shares the flag support cache with the `Build` it was cloned from,
+/// so an answer may only be reused for a probe that would run the same way.
+#[test]
+fn flag_support_cache_is_per_build_env() {
+    let test = Test::gnu();
+    let build = test.gcc();
+    // Without the override the shim accepts the flag.
+    assert!(build.is_flag_supported("-Wprobed").unwrap());
+
+    let mut rejecting = build.clone();
+    rejecting.env("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
+    // A fresh `Build` with the same environment rejects it.
+    assert!(!test
+        .gcc()
+        .env("CC_SHIM_FAIL_IF_ARG", "-Wprobed")
+        .is_flag_supported("-Wprobed")
+        .unwrap());
+    assert!(
+        !rejecting.is_flag_supported("-Wprobed").unwrap(),
+        "the clone reused the answer probed with a different `Build::env`"
+    );
+}
+
+#[test]
+fn flag_support_cache_is_per_target() {
+    let test = Test::gnu();
+    let mut build = test.gcc();
+    // One compiler for both targets, like `CC=clang`, that rejects the flag
+    // only when it compiles for x86.
+    build
+        .compiler(test.td.path().join("cc"))
+        .target("x86_64-unknown-linux-gnu")
+        .host("x86_64-unknown-linux-gnu")
+        .env("CC_SHIM_FAIL_IF_ARG", "-m32");
+    assert!(build.is_flag_supported("-Wprobed").unwrap());
+
+    let mut x86 = build.clone();
+    x86.target("i686-unknown-linux-gnu");
+    // A fresh `Build` for x86 rejects it.
+    let mut fresh = test.gcc();
+    fresh
+        .compiler(test.td.path().join("cc"))
+        .target("i686-unknown-linux-gnu")
+        .host("x86_64-unknown-linux-gnu")
+        .env("CC_SHIM_FAIL_IF_ARG", "-m32");
+    assert!(!fresh.is_flag_supported("-Wprobed").unwrap());
+    assert!(
+        !x86.is_flag_supported("-Wprobed").unwrap(),
+        "the clone reused the answer probed for another target"
+    );
+}
+
+#[test]
+fn flag_support_cache_is_per_language() {
+    let mut test = Test::gnu();
+    // Only a C++ probe reads `CXXFLAGS`.
+    test.env.set("CXXFLAGS", "-Dprobed_as_cpp");
+    let mut build = test.gcc();
+    build
+        .compiler(test.td.path().join("cc"))
+        .env("CC_SHIM_FAIL_IF_ARG", "-Dprobed_as_cpp");
+    assert!(build.is_flag_supported("-Wprobed").unwrap());
+
+    let mut cpp = build.clone();
+    cpp.cpp(true);
+    assert!(
+        !cpp.is_flag_supported("-Wprobed").unwrap(),
+        "the clone reused the answer probed for C"
+    );
+}
+
+/// The probe also depends on the inherited environment, which a clone made
+/// before the first read takes on its own.
+#[test]
+fn flag_support_cache_is_per_process_env() {
+    let mut test = Test::gnu();
+    test.env.remove("CC_SHIM_FAIL_IF_ARG");
+    let mut build = test.gcc();
+    build.compiler(test.td.path().join("cc"));
+    let later = build.clone();
+    assert!(build.is_flag_supported("-Wprobed").unwrap());
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
+    assert!(
+        !later.is_flag_supported("-Wprobed").unwrap(),
+        "the answer was reused for a clone that inherited another environment"
+    );
+}
+
+/// A `Build` reads the process environment on first use, not when it is made.
+#[test]
+fn env_snapshot_is_taken_on_first_read() {
+    let mut test = Test::gnu();
+    let mut build = test.gcc();
+    test.env.set("CFLAGS", "-Dset_after_new");
+    build.file("foo.c").compile("foo");
+    test.cmd(0).must_have("-Dset_after_new");
+}
+
+/// Changes after the first read reach neither cc's own lookups nor the child
+/// processes, so both agree with the flag support cache key.
+#[test]
+fn env_snapshot_ignores_later_changes() {
+    let mut test = Test::gnu();
+    test.env.remove("CC_SHIM_FAIL_IF_ARG");
+    let mut build = test.gcc();
+    build.file("foo.c").flag_if_supported("-Wprobed");
+    build.try_get_compiler().unwrap();
+    // Read by cc.
+    test.env.set("CFLAGS", "-Dset_after_first_read");
+    // Read by the compiler: the shim fails on this argument.
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
+    build.try_compile("foo").unwrap();
+    test.cmd(0)
+        .must_have("-Wprobed")
+        .must_not_have("-Dset_after_first_read");
+}
+
+/// A child process gets the snapshot's value of a variable changed later.
+#[test]
+fn env_snapshot_restores_changed_variables() {
+    let mut test = Test::gnu();
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "-Dnot_passed");
+    let mut build = test.gcc();
+    build.file("foo.c");
+    build.try_get_compiler().unwrap();
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "foo.c");
+    build.try_compile("foo").unwrap();
+}
+
+/// `Build::env` wins over the snapshot, also when set after the first read.
+#[test]
+fn env_snapshot_is_overridden_by_build_env() {
+    let mut test = Test::gnu();
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "foo.c");
+    let mut build = test.gcc();
+    build.file("foo.c");
+    build.try_get_compiler().unwrap();
+    build.env("CC_SHIM_FAIL_IF_ARG", "-Dnot_passed");
+    build.try_compile("foo").unwrap();
+}
+
+/// A clone made before the first read takes its own snapshot, one made after
+/// keeps the snapshot of the original.
+#[test]
+fn env_snapshot_of_clones() {
+    let mut test = Test::gnu();
+    let mut build = test.gcc();
+    build.file("foo.c");
+    let before = build.clone();
+    build.try_get_compiler().unwrap();
+    test.env.set("CFLAGS", "-Dset_after_first_read");
+    let after = build.clone();
+
+    after.compile_intermediates();
+    test.cmd(0).must_not_have("-Dset_after_first_read");
+    before.compile_intermediates();
+    test.cmd(1).must_have("-Dset_after_first_read");
+}
+
+/// The `PATH` that MSVC's tool environment puts its folders in front of wins
+/// over the snapshot's.
+#[cfg(windows)]
+#[test]
+fn env_snapshot_keeps_msvc_tool_env() {
+    use std::ffi::OsStr;
+
+    let mut test = Test::new();
+    let mut build = cc::Build::new();
+    build
+        .target("x86_64-pc-windows-msvc")
+        .host("x86_64-pc-windows-msvc")
+        .opt_level(0)
+        .debug(false)
+        .out_dir(test.td.path());
+    let path_of = |envs: Vec<(&OsStr, Option<&OsStr>)>| {
+        envs.into_iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value.map(OsStr::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let tool = build.get_compiler();
+    let tool_path = path_of(tool.env().iter().map(|(k, v)| (&**k, Some(&**v))).collect());
+    if tool_path.is_empty() {
+        // No Visual Studio found.
+        return;
+    }
+    test.env.set("PATH", test.td.path());
+    let cmd = build.get_compiler().to_command();
+    assert_eq!(path_of(cmd.get_envs().collect()), tool_path);
+}
+
+/// The archiver also runs in the snapshot.
+#[test]
+fn env_snapshot_reaches_archiver() {
+    let mut test = Test::gnu();
+    let mut build = test.gcc();
+    build.file("foo.c").ar_flag("--marker");
+    build.try_get_compiler().unwrap();
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "--marker");
+    build.try_compile("foo").unwrap();
+}
+
+/// The flag support probe reads the snapshot of the `Build` it probes for, and
+/// runs in it.
+#[test]
+fn env_snapshot_reaches_flag_support_probe() {
+    let mut test = Test::gnu();
+    test.env.remove("CC_SHIM_FAIL_IF_ARG");
+    test.collect_flag_supported_probes();
+    let build = test.gcc();
+    build.try_get_compiler().unwrap();
+    test.env.set("CFLAGS", "-Dset_after_first_read");
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
+    assert!(build.is_flag_supported("-Wprobed").unwrap());
+    test.get_flag_supported_probes(0)
+        .must_have("-Wprobed")
+        .must_not_have("-Dset_after_first_read");
+}
+
+/// For a cross target, cc runs `<prefix>-ar --version` to pick the archiver,
+/// in the snapshot too.
+#[test]
+fn env_snapshot_reaches_cross_archiver_probe() {
+    let mut test = Test::gnu();
+    test.shim("aarch64-linux-gnu-ar");
+    for var in [
+        "CROSS_COMPILE",
+        "RUSTC_LINKER",
+        "AR_aarch64-unknown-linux-gnu",
+        "AR_aarch64_unknown_linux_gnu",
+        "TARGET_AR",
+        "CC_SHIM_FAIL_IF_ARG",
+    ] {
+        test.env.remove(var);
+    }
+    // The probe doesn't get `Build::env`, so the shim has to be on the
+    // inherited `PATH`.
+    test.env.set("PATH", test.td.path());
+    let mut build = test.gcc();
+    build
+        .target("aarch64-unknown-linux-gnu")
+        .host("x86_64-unknown-linux-gnu");
+    build.try_get_compiler().unwrap();
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "--version");
+    let archiver = build.try_get_archiver().unwrap();
+    assert_eq!(archiver.get_program(), "aarch64-linux-gnu-ar");
+}
+
+/// For Android, cc runs `llvm-ar --version` to pick the archiver, in the
+/// snapshot too.
+#[test]
+fn env_snapshot_reaches_android_archiver_probe() {
+    let mut test = Test::gnu();
+    test.shim("llvm-ar");
+    for var in [
+        "AR_aarch64-linux-android",
+        "AR_aarch64_linux_android",
+        "TARGET_AR",
+        "CC_SHIM_FAIL_IF_ARG",
+    ] {
+        test.env.remove(var);
+    }
+    let mut build = test.gcc();
+    build
+        .target("aarch64-linux-android")
+        .host("x86_64-unknown-linux-gnu")
+        .compiler(test.td.path().join("cc"));
+    build.try_get_compiler().unwrap();
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "--version");
+    let archiver = build.try_get_archiver().unwrap();
+    assert_eq!(archiver.get_program(), "llvm-ar");
+}
+
+/// For Android, cc looks for the compiler by running each candidate name, in
+/// the snapshot too.
+#[test]
+fn env_snapshot_reaches_android_compiler_probe() {
+    let mut test = Test::gnu();
+    test.shim("aarch64-linux-android-gcc");
+    for var in [
+        "CC_aarch64-linux-android",
+        "CC_aarch64_linux_android",
+        "TARGET_CC",
+    ] {
+        test.env.remove(var);
+    }
+    // The probe doesn't get `Build::env`, so the shim has to be on the
+    // inherited `PATH`.
+    test.env.set("PATH", test.td.path());
+    let mut build = test.gcc();
+    build
+        .target("aarch64-linux-android")
+        .host("x86_64-unknown-linux-gnu");
+    build.try_get_compiler().unwrap();
+    test.env.set("PATH", test.td.path().join("empty"));
+    let compiler = build.try_get_compiler().unwrap();
+    // Not found, cc would fall back to `aarch64-linux-android-clang`. On
+    // Windows it also turns either name into `gcc.exe` or `clang.exe`.
+    let name = compiler.path().file_stem().unwrap().to_str().unwrap();
+    assert!(name.ends_with("gcc"), "{name}");
+}
+
+/// Compiler family detection runs the compiler in the snapshot too.
+#[test]
+fn env_snapshot_reaches_family_detection() {
+    let mut test = Test::gnu();
+    // The probe resolves `cc` through the inherited `PATH`, so this `Build`
+    // doesn't set one with `Build::env`.
+    test.env.set("PATH", test.td.path());
+    let probe_record = test.td.path().join("family-detection");
+    let mut build = cc::Build::new();
+    build
+        .target("x86_64-unknown-linux-gnu")
+        .host("x86_64-unknown-linux-gnu")
+        .opt_level(2)
+        .out_dir(test.td.path())
+        .compiler("cc")
+        .env("CC_SHIM_OUT_FILES_FOR_FAMILY_DETECTION", &probe_record);
+    build.try_flags_from_environment("CFLAGS").unwrap();
+    test.env.set("PATH", test.td.path().join("empty"));
+    build.try_get_compiler().unwrap();
+    assert!(probe_record.exists());
+}
+
+/// Error messages show the command, not the environment cc sets on it.
+#[test]
+fn env_snapshot_stays_out_of_error_messages() {
+    let mut test = Test::gnu();
+    test.env.set("CC_TEST_SECRET", "env_snapshot_secret_value");
+    test.env.set("CC_SHIM_FAIL_IF_ARG", "foo.c");
+    let error = test
+        .gcc()
+        .file("foo.c")
+        // Forwarded stderr is written to stdout directly, past the test
+        // harness's capture.
+        .cargo_warnings(false)
+        .try_compile("foo")
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("command did not execute successfully"),
+        "{message}"
+    );
+    assert!(!message.contains("env_snapshot_secret_value"), "{message}");
+}
+
+/// The host decides whether the probe reads `HOST_CFLAGS` or `TARGET_CFLAGS`.
+#[test]
+fn flag_support_cache_is_per_host() {
+    let mut test = Test::gnu();
+    for var in [
+        "CC_SHIM_FAIL_IF_ARG",
+        "CFLAGS_x86_64-unknown-linux-gnu",
+        "CFLAGS_x86_64_unknown_linux_gnu",
+        "HOST_CFLAGS",
+    ] {
+        test.env.remove(var);
+    }
+    let mut build = test.gcc();
+    build
+        .compiler(test.td.path().join("cc"))
+        .target("x86_64-unknown-linux-gnu")
+        .host("x86_64-unknown-linux-gnu");
+    test.env.set("TARGET_CFLAGS", "-m32");
+    build.env("CC_SHIM_FAIL_IF_ARG", "-m32");
+    assert!(build.is_flag_supported("-Wprobed").unwrap());
+    let mut cross = build.clone();
+    cross.host("aarch64-unknown-linux-gnu");
+    assert!(
+        !cross.is_flag_supported("-Wprobed").unwrap(),
+        "the clone reused the answer probed for another host"
+    );
+}
+
+#[test]
+fn gnu_create_archive() {
+    let test = Test::gnu();
+    let extra = test.td.path().join("extra.o");
+    let mut build = test.gcc();
+    build.file("foo.c").object(&extra);
+    let objects = build.compile_intermediates();
+    let library = build.try_create_archive("foo", &objects).unwrap();
+
+    assert_eq!(library, test.td.path().join("libfoo.a"));
+    // The objects passed in come first, then those added with `object`.
+    test.cmd(1)
+        .must_have("cqD")
+        .must_have(&library)
+        .must_have_in_order(objects[0].to_str().unwrap(), extra.to_str().unwrap());
+    test.cmd(2).must_have("sD").must_have(&library);
+
+    // The deprecated `lib<name>.a` form names the same file.
+    let library = build.try_create_archive("libfoo.a", &objects).unwrap();
+    assert_eq!(library, test.td.path().join("libfoo.a"));
+}
+
+#[test]
+fn msvc_create_archive() {
+    let test = Test::msvc();
+    let mut build = test.gcc();
+    build.file("foo.c");
+    let objects = build.compile_intermediates();
+    let library = build.try_create_archive("foo", &objects).unwrap();
+
+    assert_eq!(library, test.td.path().join("libfoo.a"));
+    let mut out = std::ffi::OsString::from("-out:");
+    out.push(&library);
+    test.cmd(1).must_have(out).must_have(&objects[0]);
+    // As with `compile`, the library is also available as `foo.lib`.
+    assert!(test.td.path().join("foo.lib").is_file());
+}
+
+#[test]
+fn create_archive_checks_its_arguments() {
+    let test = Test::gnu();
+    let build = test.gcc();
+    for output in ["", "a/b", "..", "/foo"] {
+        let err = build
+            .try_create_archive(output, ["foo.o"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("InvalidArgument: argument of `create_archive`"),
+            "{output:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn create_archive_respects_cc_force_disable() {
+    let mut test = Test::gnu();
+    test.env.set("CC_FORCE_DISABLE", "1");
+    let err = test
+        .gcc()
+        .try_create_archive("foo", ["foo.o"])
+        .unwrap_err()
+        .to_string();
+    assert!(err.starts_with("Disabled: "), "{err}");
+    assert!(!test.td.path().join("out0").exists(), "the archiver ran");
+}
+
+#[test]
+fn emit_link_directives_checks_its_arguments() {
+    {
+        let test = Test::gnu();
+        let mut build = test.gcc();
+        build.cargo_metadata(false);
+        for library in [
+            "out/foo.a",
+            "out/lib.a",
+            "out/libfoo.so",
+            "libfoo.a",
+            "out/foo.lib",
+        ] {
+            let err = cc::try_emit_link_directives(&build, library)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with("InvalidArgument: `emit_link_directives` expects"),
+                "{library:?}: {err}"
+            );
+        }
+        cc::try_emit_link_directives(&build, "out/libfoo.a").unwrap();
+    }
+
+    // `<name>.lib` is only a static library name on MSVC targets.
+    let test = Test::msvc();
+    let mut build = test.gcc();
+    build.cargo_metadata(false).cargo_warnings(false);
+    cc::try_emit_link_directives(&build, "out/foo.lib").unwrap();
+    cc::try_emit_link_directives(&build, "out/libfoo.a").unwrap();
+}
+
+/// `compile_intermediates`, `create_archive` and `emit_link_directives` run
+/// the same archiver commands and emit the same link lines as `compile`.
+///
+/// This test runs the builds in a subprocess so we
+/// can capture and assert on the emitted cargo metadata.
+#[test]
+fn create_archive_and_emit_link_directives_match_compile() {
+    // When invoked as subprocess, perform the builds and return.
+    if let Some(case) = env::var_os("__CC_TEST_SPLIT_COMPILE") {
+        let case = case.into_string().unwrap();
+        let (case, how) = case.split_once(' ').unwrap();
+        // `cuda` builds a CUDA file, which also device-links the archive.
+        let cuda = case == "cuda";
+        let target = if cuda {
+            "x86_64-unknown-linux-gnu"
+        } else {
+            case
+        };
+        let msvc = target.ends_with("-msvc");
+        let test = if msvc { Test::msvc() } else { Test::gnu() };
+        test.shim("clang++").shim("nvcc");
+        let mut build = test.gcc();
+        build
+            .target(target)
+            .host(target)
+            .cpp(true)
+            .cpp_link_stdlib_static(true)
+            .link_lib_modifier("+whole-archive");
+        if !msvc {
+            build.archiver(test.td.path().join("ar"));
+        }
+        if cuda {
+            build
+                .cuda(true)
+                .compiler(test.td.path().join("nvcc"))
+                .file("foo.cu");
+        } else {
+            build.file("foo.cpp");
+            if target != "x86_64-unknown-linux-gnu" && !msvc {
+                build.compiler(test.td.path().join("clang++"));
+            }
+        }
+        // The test shim always creates `libfoo.a`, which MSVC needs to copy.
+        let names: &[&str] = if msvc { &["foo"] } else { &["foo", "bar"] };
+        for name in names {
+            if how == "compile" {
+                build.compile(name);
+            } else {
+                let objects = build.compile_intermediates();
+                let library = build.create_archive(name, &objects);
+                if how == "split-lib" {
+                    cc::emit_link_directives(&build, library.with_file_name(format!("{name}.lib")));
+                } else {
+                    cc::emit_link_directives(&build, &library);
+                }
+            }
+        }
+        for i in 0.. {
+            let Ok(args) = std::fs::read_to_string(test.td.path().join(format!("out{i}"))) else {
+                break;
+            };
+            println!("ran: {}", args.lines().collect::<Vec<_>>().join(" "));
+        }
+        println!("out-dir: {}", test.td.path().display());
+        return;
+    }
+
+    let run = |target: &str, how: &str| -> Vec<String> {
+        let output = Command::new(env::current_exe().unwrap())
+            .env("__CC_TEST_SPLIT_COMPILE", format!("{target} {how}"))
+            .env("PAUTHTEST_SYSROOT", "sysroot")
+            .env("PAUTHTEST_RESOURCE_DIR", "resource-dir")
+            .env_remove("CXXSTDLIB")
+            .env_remove("CXXSTDLIB_STATIC")
+            .env_remove("CC_ENABLE_DEBUG_OUTPUT")
+            .args([
+                "--exact",
+                "create_archive_and_emit_link_directives_match_compile",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "subprocess failed: {:?}", output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let out_dir = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("out-dir: "))
+            .unwrap();
+        let stdout = stdout.replace(out_dir, "<out-dir>");
+        stdout
+            .lines()
+            .filter(|line| {
+                line.starts_with("cargo:rustc-")
+                    || line.starts_with("cargo:rerun-if-env-changed=")
+                    // The shim can't answer family detection, and the failed
+                    // probe's file name is random.
+                    || (line.starts_with("cargo:warning=")
+                        && !line.contains("detect_compiler_family"))
+                    || line.starts_with("ran: ")
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let link_lib_lines = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|line| line.strip_prefix("cargo:rustc-link-lib="))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    for (target, link_libs) in [
+        (
+            "x86_64-unknown-linux-gnu",
+            &[
+                "static:+whole-archive=foo",
+                "static:-bundle=stdc++",
+                "static:+whole-archive=bar",
+            ][..],
+        ),
+        (
+            "aarch64-unknown-linux-pauthtest",
+            &[
+                "static:+whole-archive=foo",
+                "static=c++",
+                "static:+whole-archive=bar",
+                "static=c++",
+            ][..],
+        ),
+        (
+            "cuda",
+            &[
+                "static:+whole-archive=foo",
+                "static:-bundle=stdc++",
+                "cudart_static",
+                "static:+whole-archive=bar",
+                "cudart_static",
+            ][..],
+        ),
+        ("x86_64-pc-windows-msvc", &["static:+whole-archive=foo"][..]),
+    ] {
+        let compile = run(target, "compile");
+        assert_eq!(link_lib_lines(&compile), link_libs, "{target}");
+        if target == "cuda" {
+            assert!(
+                compile.iter().any(|line| line.contains("--device-link")),
+                "{compile:#?}"
+            );
+        }
+        let mut hows = vec!["split"];
+        if target.ends_with("-msvc") {
+            hows.push("split-lib");
+        }
+        for how in hows {
+            assert_eq!(run(target, how), compile, "{target} {how}");
+        }
+    }
 }
