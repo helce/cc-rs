@@ -363,7 +363,7 @@ impl<'a> TargetInfo<'a> {
             "3ds" | "rtems" | "espidf" => env = "newlib",
             "vxworks" => env = "gnu",
             "redox" => env = "relibc",
-            "aix" => abi = "vec-extabi",
+            "aix" => abi = "vec-default",
             _ => {}
         }
 

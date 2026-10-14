@@ -5,7 +5,7 @@
 use std::env;
 use std::process::Command;
 
-use crate::support::Test;
+use crate::support::{GlobalEnv, Test};
 
 mod support;
 
@@ -432,7 +432,7 @@ fn gnu_flag_if_supported() {
 #[test]
 fn flag_if_supported_without_out_dir() {
     let mut test = Test::gnu();
-    test.env.remove("OUT_DIR");
+    test.process_env.remove("OUT_DIR");
     test.collect_flag_supported_probes();
 
     let compiler = test
@@ -812,6 +812,190 @@ fn asm_flags() {
 }
 
 #[test]
+fn msvc_masm_env_override() {
+    let mut test = Test::msvc();
+    test.shim("masm-wrapper");
+    test.env.set("CC_MASM_ASM", "masm-wrapper --from-env");
+    test.gcc().debug(true).file("foo.asm").compile("foo");
+
+    test.cmd_for_source("foo.asm")
+        .must_run("masm-wrapper")
+        .must_have_in_order("--from-env", "-nologo")
+        .must_have("-Zi")
+        .must_not_have("-m64");
+}
+
+#[test]
+fn msvc_masm_env_override_with_target_prefix() {
+    let mut test = Test::msvc();
+    test.shim("masm-generic").shim("masm-for-target");
+    test.env.set("CC_MASM_ASM", "masm-generic --generic");
+    test.env.set(
+        "CC_MASM_ASM_x86_64_pc_windows_msvc",
+        "masm-for-target --for-target",
+    );
+    test.gcc().file("foo.asm").compile("foo");
+
+    test.cmd_for_source("foo.asm")
+        .must_run("masm-for-target")
+        .must_have("--for-target")
+        .must_not_have("--generic");
+}
+
+#[test]
+fn msvc_masm_llvm_ml_gets_target_bitness() {
+    for (target, bitness, other) in [
+        ("x86_64-pc-windows-msvc", "-m64", "-m32"),
+        ("i686-pc-windows-msvc", "-m32", "-m64"),
+    ] {
+        let mut test = Test::msvc();
+        test.shim("llvm-ml");
+        test.env.set("CC_MASM_ASM", "llvm-ml");
+        test.gcc()
+            .target(target)
+            .host(target)
+            .debug(true)
+            .file("foo.asm")
+            .compile("foo");
+
+        test.cmd_for_source("foo.asm")
+            .must_run("llvm-ml")
+            .must_have(bitness)
+            .must_not_have(other)
+            .must_not_have("-Zi");
+    }
+}
+
+#[test]
+fn msvc_masm_llvm_ml_name_ignores_case() {
+    let mut test = Test::msvc();
+    test.shim("LLVM-ML.exe");
+    test.env.set("CC_MASM_ASM", "LLVM-ML.exe");
+    test.gcc().debug(true).file("foo.asm").compile("foo");
+
+    test.cmd_for_source("foo.asm")
+        .must_run("LLVM-ML")
+        .must_have("-m64")
+        .must_not_have("-Zi");
+}
+
+#[test]
+fn msvc_masm_llvm_ml_user_bitness_wins() {
+    let mut test = Test::msvc();
+    test.shim("llvm-ml");
+    test.env.set("CC_MASM_ASM", "llvm-ml -m32");
+    test.gcc().file("foo.asm").compile("foo");
+
+    // llvm-ml takes the last `-m`.
+    test.cmd_for_source("foo.asm")
+        .must_run("llvm-ml")
+        .must_have_in_order("-m64", "-m32");
+}
+
+// A Windows host with Visual Studio finds `ml64.exe` there, so the fallback to
+// llvm-ml can only be tested elsewhere. The shims here also have no `.exe`
+// suffix.
+#[cfg(not(windows))]
+mod msvc_masm_fallback {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::Test;
+
+    /// Put clang-cl and the LLVM `tool` in a folder that is not on `PATH`, so
+    /// the tool can only be found through clang-cl.
+    fn clang_cl_with(test: &Test, tool: &str) -> PathBuf {
+        let llvm_bin = test.td.path().join("llvm").join("bin");
+        fs::create_dir_all(&llvm_bin).unwrap();
+        fs::copy(&test.gcc, llvm_bin.join("clang-cl")).unwrap();
+        fs::copy(&test.gcc, llvm_bin.join(tool)).unwrap();
+        llvm_bin
+    }
+
+    #[test]
+    fn llvm_ml_on_path() {
+        let test = Test::msvc();
+        test.shim("llvm-ml");
+        test.gcc().debug(true).file("foo.asm").compile("foo");
+
+        test.cmd_for_source("foo.asm")
+            .must_run("llvm-ml")
+            .must_have("-m64")
+            .must_not_have("-Zi");
+    }
+
+    #[test]
+    fn llvm_ml_next_to_clang_cl() {
+        let test = Test::msvc();
+        let llvm_bin = clang_cl_with(&test, "llvm-ml");
+        test.gcc()
+            .compiler(llvm_bin.join("clang-cl"))
+            .file("foo.asm")
+            .file("bar.asm")
+            .compile("foo");
+
+        for src in ["foo.asm", "bar.asm"] {
+            let execution = test.cmd_for_source(src);
+            execution.must_have("-m64");
+            assert_eq!(execution.program, llvm_bin.join("llvm-ml"));
+        }
+        // One lookup serves both files.
+        test.cmd_for_source("--print-search-dirs")
+            .must_run("clang-cl");
+    }
+
+    #[test]
+    fn ml_on_path_is_kept() {
+        let test = Test::msvc();
+        test.shim("ml64.exe").shim("llvm-ml");
+        test.gcc().debug(true).file("foo.asm").compile("foo");
+
+        test.cmd_for_source("foo.asm")
+            .must_run("ml64")
+            .must_have("-Zi")
+            .must_not_have("-m64");
+    }
+
+    #[test]
+    fn no_llvm_ml_for_arm() {
+        let test = Test::msvc();
+        test.shim("llvm-ml");
+        let result = test
+            .gcc()
+            .target("aarch64-pc-windows-msvc")
+            .host("aarch64-pc-windows-msvc")
+            .cargo_warnings(false)
+            .file("foo.asm")
+            .try_compile("foo");
+
+        assert!(
+            !test.td.path().join("out0").exists(),
+            "{:?} ran",
+            test.cmd(0).program
+        );
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("armasm64.exe"), "{err}");
+    }
+
+    #[test]
+    fn clang_cl_archiver_is_llvm_lib_next_to_it() {
+        let test = Test::new();
+        let llvm_bin = clang_cl_with(&test, "llvm-lib");
+        test.gcc()
+            .target("x86_64-pc-windows-msvc")
+            .host("x86_64-pc-windows-msvc")
+            .compiler(llvm_bin.join("clang-cl"))
+            .file("foo.c")
+            .compile("foo");
+
+        let mut out = OsString::from("-out:");
+        out.push(test.td.path().join("libfoo.a"));
+        assert_eq!(test.cmd_for_source(out).program, llvm_bin.join("llvm-lib"));
+    }
+}
+
+#[test]
 fn gnu_apple_sysroot() {
     let targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
 
@@ -984,10 +1168,11 @@ fn clang_apple_tvos() {
 #[cfg(target_os = "macos")]
 #[test]
 fn clang_apple_mac_catalyst() {
-    let output = std::process::Command::new("xcrun")
-        .args(["--show-sdk-path", "--sdk", "macosx"])
-        .output()
-        .unwrap();
+    let output = GlobalEnv::output(std::process::Command::new("xcrun").args([
+        "--show-sdk-path",
+        "--sdk",
+        "macosx",
+    ]));
     if !output.status.success() {
         return;
     }
@@ -1041,10 +1226,11 @@ fn clang_apple_tvsimulator() {
 #[test]
 fn clang_apple_visionos() {
     // Only run this test if visionOS is available on the host machine
-    let output = std::process::Command::new("xcrun")
-        .args(["--show-sdk-version", "--sdk", "xros"])
-        .output()
-        .unwrap();
+    let output = GlobalEnv::output(std::process::Command::new("xcrun").args([
+        "--show-sdk-version",
+        "--sdk",
+        "xros",
+    ]));
     if !output.status.success() {
         return;
     }
@@ -1070,10 +1256,11 @@ fn clang_apple_visionos() {
 #[cfg(target_os = "macos")]
 #[test]
 fn apple_sdkroot_wrong() {
-    let output = std::process::Command::new("xcrun")
-        .args(["--show-sdk-path", "--sdk", "iphoneos"])
-        .output()
-        .unwrap();
+    let output = GlobalEnv::output(std::process::Command::new("xcrun").args([
+        "--show-sdk-path",
+        "--sdk",
+        "iphoneos",
+    ]));
     if !output.status.success() {
         return;
     }
@@ -1145,6 +1332,94 @@ fn clang_android() {
             .shim("llvm-ar");
         test.gcc().target(target).file("foo.c").compile("foo");
         test.cmd(0).must_not_have("--target=arm-linux-androideabi");
+    }
+}
+
+#[test]
+fn clang_android_name_ignores_case() {
+    let target = "arm-linux-androideabi";
+    let name = "ARM-LINUX-ANDROIDEABI-CLANG";
+    let mut test = Test::new();
+    test.shim(name);
+    test.env.set("CC", test.td.path().join(name));
+    let host = if cfg!(windows) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    };
+    let compiler = test.gcc().target(target).host(host).get_compiler();
+    assert!(compiler.is_like_clang());
+    let target_args = compiler
+        .args()
+        .iter()
+        .map(|arg| arg.to_str().unwrap())
+        .filter(|arg| arg.starts_with("--target="))
+        .collect::<Vec<_>>();
+
+    if cfg!(windows) {
+        // On Windows, cc runs the NDK's clang directly with the script's target.
+        assert_eq!(compiler.path(), test.td.path().join("clang.exe"));
+        assert_eq!(target_args, ["--target=arm-linux-androideabi"]);
+    } else {
+        // Elsewhere, cc runs the script, which passes the target itself.
+        assert_eq!(compiler.path(), test.td.path().join(name));
+        assert!(target_args.is_empty(), "{target_args:?}");
+    }
+}
+
+// llvm-mingw's wrappers are only recognized on hosts other than Windows.
+#[cfg(not(windows))]
+#[test]
+fn llvm_mingw_wrapper_name_ignores_case() {
+    let name = "x86_64-w64-mingw32-Clang";
+    let mut test = Test::new();
+    test.shim(name);
+    test.env.set("CC", test.td.path().join(name));
+    let compiler = test
+        .gcc()
+        .target("x86_64-pc-windows-gnu")
+        .host("x86_64-unknown-linux-gnu")
+        .get_compiler();
+
+    assert!(compiler.is_like_clang());
+    assert!(
+        !compiler
+            .args()
+            .iter()
+            .any(|arg| arg.to_str().unwrap().starts_with("--target=")),
+        "{:?}",
+        compiler.args()
+    );
+}
+
+#[test]
+fn compiler_family_from_name_ignores_case() {
+    // The shim can't preprocess, so cc falls back to the compiler's name.
+    for (name, clang, msvc, clang_cl) in [
+        ("CLANG", true, false, false),
+        ("ZIG", true, false, false),
+        ("Clang-CL", false, true, true),
+        ("CL", false, true, false),
+        ("CL.exe", false, true, false),
+    ] {
+        let test = Test::new();
+        test.shim(name);
+        let compiler = test
+            .gcc()
+            .target("x86_64-pc-windows-msvc")
+            .host("x86_64-pc-windows-msvc")
+            .compiler(test.td.path().join(name))
+            .get_compiler();
+
+        assert_eq!(
+            (
+                compiler.is_like_clang(),
+                compiler.is_like_msvc(),
+                compiler.is_like_clang_cl()
+            ),
+            (clang, msvc, clang_cl),
+            "{name}"
+        );
     }
 }
 
@@ -1242,7 +1517,7 @@ fn out_dir_source_object_name_does_not_depend_on_build_path() {
 
     fn object_name(mut test: Test) -> std::ffi::OsString {
         let out_dir = test.td.path().to_path_buf();
-        test.env.set("OUT_DIR", &out_dir);
+        test.process_env.set("OUT_DIR", &out_dir);
         let intermediates = test
             .gcc()
             .file(out_dir.join("gen.c"))
@@ -1396,11 +1671,11 @@ fn gnu_ar_probe_failure_no_warning() {
         return;
     }
 
-    let output = Command::new(env::current_exe().unwrap())
-        .env("__CC_TEST_AR_PROBE_STDERR", "1")
-        .args(["--exact", "gnu_ar_probe_failure_no_warning", "--nocapture"])
-        .output()
-        .unwrap();
+    let output = GlobalEnv::output(
+        Command::new(env::current_exe().unwrap())
+            .env("__CC_TEST_AR_PROBE_STDERR", "1")
+            .args(["--exact", "gnu_ar_probe_failure_no_warning", "--nocapture"]),
+    );
     assert!(output.status.success(), "subprocess failed: {:?}", output);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1439,16 +1714,16 @@ fn compiler_stderr_forwarded_once_per_line() {
     }
 
     let run = |case: &str| -> Vec<String> {
-        let output = Command::new(env::current_exe().unwrap())
-            .env("__CC_TEST_STDERR_LINES", case)
-            .env_remove("CC_ENABLE_DEBUG_OUTPUT")
-            .args([
-                "--exact",
-                "compiler_stderr_forwarded_once_per_line",
-                "--nocapture",
-            ])
-            .output()
-            .unwrap();
+        let output = GlobalEnv::output(
+            Command::new(env::current_exe().unwrap())
+                .env("__CC_TEST_STDERR_LINES", case)
+                .env_remove("CC_ENABLE_DEBUG_OUTPUT")
+                .args([
+                    "--exact",
+                    "compiler_stderr_forwarded_once_per_line",
+                    "--nocapture",
+                ]),
+        );
         assert!(output.status.success(), "subprocess failed: {:?}", output);
         let stdout: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -1650,7 +1925,7 @@ fn message_logger() {
             .env_remove("TARGET_AR")
             .env_remove("SDKROOT")
             .env_remove("IPHONEOS_DEPLOYMENT_TARGET");
-        let output = cmd.output().unwrap();
+        let output = GlobalEnv::output(&mut cmd);
         assert!(output.status.success(), "subprocess failed: {:?}", output);
         let stdout = String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -1931,13 +2206,13 @@ fn cpp_link_stdlib_static_metadata() {
     }
 
     let link_lib_lines = |case: &str, envs: &[(&str, &str)]| -> Vec<String> {
-        let output = Command::new(env::current_exe().unwrap())
-            .env("__CC_TEST_CPP_LINK_STDLIB_STATIC", case)
-            .env_remove("CXXSTDLIB")
-            .envs(envs.iter().copied())
-            .args(["--exact", "cpp_link_stdlib_static_metadata", "--nocapture"])
-            .output()
-            .unwrap();
+        let output = GlobalEnv::output(
+            Command::new(env::current_exe().unwrap())
+                .env("__CC_TEST_CPP_LINK_STDLIB_STATIC", case)
+                .env_remove("CXXSTDLIB")
+                .envs(envs.iter().copied())
+                .args(["--exact", "cpp_link_stdlib_static_metadata", "--nocapture"]),
+        );
         assert!(output.status.success(), "subprocess failed: {:?}", output);
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -2047,20 +2322,20 @@ fn cxxstdlib_static_env_metadata() {
     }
 
     let metadata_lines = |case: &str, envs: &[(&str, &str)]| -> Vec<String> {
-        let output = Command::new(env::current_exe().unwrap())
-            .env("__CC_TEST_CXXSTDLIB_STATIC", case)
-            .env_remove("CXXSTDLIB")
-            .env_remove("CXXSTDLIB_STATIC")
-            .env_remove("HOST_CXXSTDLIB_STATIC")
-            .env_remove("TARGET_CXXSTDLIB_STATIC")
-            .env_remove("CXXSTDLIB_STATIC_x86_64-unknown-linux-gnu")
-            .env_remove("CXXSTDLIB_STATIC_x86_64_unknown_linux_gnu")
-            .env_remove("CXXSTDLIB_STATIC_x86_64-apple-darwin")
-            .env_remove("CXXSTDLIB_STATIC_x86_64_apple_darwin")
-            .envs(envs.iter().copied())
-            .args(["--exact", "cxxstdlib_static_env_metadata", "--nocapture"])
-            .output()
-            .unwrap();
+        let output = GlobalEnv::output(
+            Command::new(env::current_exe().unwrap())
+                .env("__CC_TEST_CXXSTDLIB_STATIC", case)
+                .env_remove("CXXSTDLIB")
+                .env_remove("CXXSTDLIB_STATIC")
+                .env_remove("HOST_CXXSTDLIB_STATIC")
+                .env_remove("TARGET_CXXSTDLIB_STATIC")
+                .env_remove("CXXSTDLIB_STATIC_x86_64-unknown-linux-gnu")
+                .env_remove("CXXSTDLIB_STATIC_x86_64_unknown_linux_gnu")
+                .env_remove("CXXSTDLIB_STATIC_x86_64-apple-darwin")
+                .env_remove("CXXSTDLIB_STATIC_x86_64_apple_darwin")
+                .envs(envs.iter().copied())
+                .args(["--exact", "cxxstdlib_static_env_metadata", "--nocapture"]),
+        );
         assert!(output.status.success(), "subprocess failed: {:?}", output);
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -2146,6 +2421,411 @@ fn cxxstdlib_static_env_metadata() {
     }
 }
 
+/// What the C++ stdlib probe of a Clang that uses libc++ prints.
+const LIBCXX_PROBE_STDOUT: &str = "# 1 \"detect_cpp_stdlib.cpp\"\n#pragma message(\"libcxx\")\n";
+
+/// A `Build` for a C++ library with Clang, on a target that links libstdc++ by
+/// default, whose C++ stdlib probe prints `probe_stdout`, or fails without it.
+fn clang_cpp_build(test: &Test, probe_stdout: Option<&str>) -> cc::Build {
+    let mut build = test.gcc();
+    build
+        .target("x86_64-unknown-linux-gnu")
+        .host("x86_64-unknown-linux-gnu")
+        .cpp(true)
+        .file("foo.cpp")
+        .compiler(test.td.path().join("clang++"))
+        .archiver(test.td.path().join("ar"));
+    if let Some(stdout) = probe_stdout {
+        build.env("CC_SHIM_STDOUT_FOR_CPP_STDLIB_DETECTION", stdout);
+    }
+    build
+}
+
+/// Like [`clang_cpp_build`], with a probe that finds libc++.
+fn libcxx_clang_build(test: &Test) -> cc::Build {
+    clang_cpp_build(test, Some(LIBCXX_PROBE_STDOUT))
+}
+
+/// On a target that links libstdc++ by default, a Clang that uses libc++ gets
+/// `c++` linked instead, and anything else keeps `stdc++`.
+///
+/// This test runs the builds in a subprocess so we
+/// can capture and assert on the emitted cargo metadata.
+#[test]
+fn cpp_stdlib_detection_metadata() {
+    // When invoked as subprocess, perform the builds and return.
+    if let Some(case) = env::var_os("__CC_TEST_CPP_STDLIB_DETECTION") {
+        let mut test = Test::clang();
+        test.shim("c++").shim("nvcc");
+        let library = test.td.path().join("libfoo.a");
+        let mut build = libcxx_clang_build(&test);
+        match case.to_str().unwrap() {
+            "libcxx" => {}
+            "libstdcxx" => {
+                // Only the message counts, not a path that mentions libcxx.
+                let probe_stdout = "# 1 \"/build/libcxx-sys/out/detect_cpp_stdlib.cpp\"\n";
+                build = clang_cpp_build(&test, Some(probe_stdout));
+            }
+            "probe-fails" => {
+                build = clang_cpp_build(&test, None);
+            }
+            "gcc" => {
+                build.compiler(test.td.path().join("c++"));
+            }
+            "cpp-link-stdlib" => {
+                build.cpp_link_stdlib("stdc++");
+            }
+            "nostdinc++" => {
+                build
+                    .flag("-nostdinc++")
+                    .flag("-isystemvendor/libc++/include");
+            }
+            "wasm32" => {
+                build.target("wasm32-unknown-unknown");
+            }
+            "windows-gnu" => {
+                // A Windows compiler ends its lines with `\r\n`.
+                let probe_stdout = LIBCXX_PROBE_STDOUT.replace('\n', "\r\n");
+                build = clang_cpp_build(&test, Some(&probe_stdout));
+                build
+                    .target("x86_64-pc-windows-gnu")
+                    .host("x86_64-pc-windows-gnu");
+                cc::emit_link_directives(&build, &library);
+                cc::emit_link_directives(&build, &library);
+                return;
+            }
+            "cuda" => {
+                test.env.set("CXX", test.td.path().join("clang++"));
+                test.env.set("NVCC", test.td.path().join("nvcc"));
+                let mut build = test.gcc();
+                build
+                    .target("x86_64-unknown-linux-gnu")
+                    .host("x86_64-unknown-linux-gnu")
+                    .cuda(true)
+                    .cudart("none")
+                    .env(
+                        "CC_SHIM_STDOUT_FOR_CPP_STDLIB_DETECTION",
+                        LIBCXX_PROBE_STDOUT,
+                    );
+                cc::emit_link_directives(&build, &library);
+                cc::emit_link_directives(&build, &library);
+                return;
+            }
+            "no-out-dir" => {
+                let mut build = test.gcc_without_out_dir();
+                build
+                    .target("x86_64-unknown-linux-gnu")
+                    .host("x86_64-unknown-linux-gnu")
+                    .cpp(true)
+                    .compiler(test.td.path().join("clang++"))
+                    .env(
+                        "CC_SHIM_STDOUT_FOR_CPP_STDLIB_DETECTION",
+                        LIBCXX_PROBE_STDOUT,
+                    );
+                cc::emit_link_directives(&build, &library);
+                cc::emit_link_directives(&build.clone(), &library);
+                return;
+            }
+            "out-dir-fails-once" => {
+                // A probe that fails for a reason outside the compiler is not
+                // remembered, so the next one can still find libc++.
+                let blocker = test.td.path().join("blocker");
+                std::fs::write(&blocker, "").unwrap();
+                build.out_dir(blocker.join("out"));
+                cc::emit_link_directives(&build, &library);
+                std::fs::remove_file(&blocker).unwrap();
+                cc::emit_link_directives(&build, &library);
+                return;
+            }
+            "force-disable" => {
+                cc::emit_link_directives(&build, &library);
+                return;
+            }
+            case => panic!("unknown case {case}"),
+        }
+        build.compile("foo");
+        build.compile("bar");
+        return;
+    }
+
+    let cargo_lines = |case: &str, envs: &[(&str, &str)]| -> Vec<String> {
+        let output = GlobalEnv::output(
+            Command::new(env::current_exe().unwrap())
+                .env("__CC_TEST_CPP_STDLIB_DETECTION", case)
+                .env_remove("CXXSTDLIB")
+                .env_remove("CXXSTDLIB_STATIC")
+                .env_remove("CC_FORCE_DISABLE")
+                .env_remove("CC_ENABLE_DEBUG_OUTPUT")
+                .env_remove("OUT_DIR")
+                .envs(envs.iter().copied())
+                .args(["--exact", "cpp_stdlib_detection_metadata", "--nocapture"]),
+        );
+        assert!(output.status.success(), "subprocess failed: {:?}", output);
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.find("cargo:").map(|i| line[i..].to_owned()))
+            .collect()
+    };
+    let link_lib_lines = |case: &str, envs: &[(&str, &str)]| -> Vec<String> {
+        cargo_lines(case, envs)
+            .iter()
+            .filter_map(|line| line.strip_prefix("cargo:rustc-link-lib="))
+            .map(str::to_owned)
+            .collect()
+    };
+    // The probe prints nothing itself, and works out the compiler again
+    // without repeating the lines and warnings the build already printed.
+    let other_lines = |case: &str| -> Vec<String> {
+        cargo_lines(case, &[])
+            .into_iter()
+            .filter(|line| {
+                !line.starts_with("cargo:rustc-link-")
+                    && !(line.starts_with("cargo:rerun-if-env-changed=")
+                        && line.contains("CXXSTDLIB"))
+            })
+            // Leave out the paths, which differ between runs.
+            .map(|line| line.split('"').next().unwrap().to_owned())
+            .collect()
+    };
+    let without_probe = other_lines("cpp-link-stdlib");
+    assert!(
+        without_probe
+            .iter()
+            .any(|line| line.starts_with("cargo:warning=")),
+        "{without_probe:?}"
+    );
+    assert_eq!(other_lines("libcxx"), without_probe);
+    assert_eq!(other_lines("probe-fails"), without_probe);
+
+    let libcxx = ["static=foo", "c++", "static=bar", "c++"];
+    let libstdcxx = ["static=foo", "stdc++", "static=bar", "stdc++"];
+    assert_eq!(link_lib_lines("libcxx", &[]), libcxx);
+    // The static stdlib follows the detected one.
+    assert_eq!(
+        link_lib_lines("libcxx", &[("CXXSTDLIB_STATIC", "1")]),
+        ["static=foo", "static:-bundle=c++", "static=bar"]
+    );
+    assert_eq!(
+        link_lib_lines("windows-gnu", &[]),
+        ["static=foo", "c++", "static=foo", "c++"]
+    );
+    assert_eq!(
+        link_lib_lines("no-out-dir", &[]),
+        ["static=foo", "c++", "static=foo", "c++"]
+    );
+    assert_eq!(
+        link_lib_lines("out-dir-fails-once", &[]),
+        ["static=foo", "stdc++", "static=foo", "c++"]
+    );
+
+    // Everything else keeps `stdc++`.
+    assert_eq!(link_lib_lines("libstdcxx", &[]), libstdcxx);
+    assert_eq!(link_lib_lines("probe-fails", &[]), libstdcxx);
+    assert_eq!(link_lib_lines("gcc", &[]), libstdcxx);
+    assert_eq!(link_lib_lines("cpp-link-stdlib", &[]), libstdcxx);
+    // A build that compiles against C++ headers of its own, such as a vendored
+    // libc++ it links in some other way, keeps `stdc++` too.
+    assert_eq!(link_lib_lines("nostdinc++", &[]), libstdcxx);
+    assert_eq!(
+        link_lib_lines("libcxx", &[("CXXSTDLIB", "stdc++")]),
+        libstdcxx
+    );
+    assert_eq!(
+        link_lib_lines("wasm32", &[]),
+        ["static=foo", "stdc++", "static=bar", "stdc++"]
+    );
+    assert_eq!(
+        link_lib_lines("cuda", &[]),
+        ["static=foo", "stdc++", "static=foo", "stdc++"]
+    );
+    assert_eq!(
+        link_lib_lines("force-disable", &[("CC_FORCE_DISABLE", "1")]),
+        ["static=foo", "stdc++"]
+    );
+}
+
+/// The C++ stdlib probe runs the compiler with the flags the build compiles
+/// with, but without the ones that write a dependency file, so it can't write
+/// one next to the build's own or overwrite it.
+#[test]
+fn cpp_stdlib_probe_drops_dependency_output_flags() {
+    let mut test = Test::clang();
+    test.collect_cpp_stdlib_probes();
+    test.env.set("CXXFLAGS", "-DFROM_ENV -MP -MFenv.d");
+    let mut build = libcxx_clang_build(&test);
+    for flag in [
+        "-stdlib=libc++",
+        "-MD",
+        "-MF",
+        "deps.d",
+        "-MMD",
+        "-MTtarget",
+        "-MQ",
+        "quoted",
+        "-MJ",
+        "db.json",
+        "-Wp,-MD,wp.d",
+    ] {
+        build.flag(flag);
+    }
+    build.compile("foo");
+
+    let probe = test
+        .get_cpp_stdlib_probes(0)
+        .expect("no C++ stdlib probe ran");
+    probe
+        .must_have("-E")
+        .must_have("-stdlib=libc++")
+        .must_have("-DFROM_ENV");
+    for arg in [
+        "-MD",
+        "-MF",
+        "deps.d",
+        "-MMD",
+        "-MTtarget",
+        "-MQ",
+        "quoted",
+        "-MJ",
+        "db.json",
+        "-Wp,-MD,wp.d",
+        "-MP",
+        "-MFenv.d",
+    ] {
+        probe.must_not_have(arg);
+    }
+    // The compile itself keeps them.
+    test.cmd_for_source("foo.cpp")
+        .must_have("-MD")
+        .must_have("deps.d")
+        .must_have("-MFenv.d");
+}
+
+/// The C++ stdlib probe runs once per command, shared by clones, and again for
+/// a command or environment it hasn't seen.
+#[test]
+fn cpp_stdlib_probe_is_cached_per_command() {
+    let mut test = Test::clang();
+    test.collect_cpp_stdlib_probes();
+    let build = libcxx_clang_build(&test);
+    build.compile("foo");
+    build.compile("bar");
+    build.clone().compile("baz");
+    assert!(test.get_cpp_stdlib_probes(0).is_some(), "no probe ran");
+    assert!(test.get_cpp_stdlib_probes(1).is_none(), "probed again");
+
+    build.clone().flag("-DOTHER").compile("foo");
+    test.get_cpp_stdlib_probes(1)
+        .expect("a new flag did not probe again")
+        .must_have("-DOTHER");
+
+    build.clone().env("CC_TEST_OTHER_ENV", "1").compile("foo");
+    assert!(
+        test.get_cpp_stdlib_probes(2).is_some(),
+        "a new environment did not probe again"
+    );
+    assert!(test.get_cpp_stdlib_probes(3).is_none());
+}
+
+/// Guard test: the C++ stdlib probe doesn't run where its answer isn't used.
+#[test]
+fn cpp_stdlib_probe_skipped() {
+    let library = |test: &Test| test.td.path().join("libfoo.a");
+    let check = |configure: &dyn Fn(&Test, &mut cc::Build)| {
+        let mut test = Test::clang();
+        test.collect_cpp_stdlib_probes().shim("c++");
+        let mut build = libcxx_clang_build(&test);
+        configure(&test, &mut build);
+        cc::emit_link_directives(&build, library(&test));
+        assert!(test.get_cpp_stdlib_probes(0).is_none(), "the probe ran");
+    };
+
+    // The stdlib is set explicitly.
+    check(&|_, build| {
+        build.cpp_link_stdlib("stdc++");
+    });
+    check(&|_, build| {
+        build.cpp_link_stdlib(None);
+    });
+    check(&|_, build| {
+        build.cpp_set_stdlib("c++");
+    });
+    // Nothing is linked without metadata.
+    check(&|_, build| {
+        build.cargo_metadata(false);
+    });
+    // Only Clang is probed.
+    check(&|test, build| {
+        build.compiler(test.td.path().join("c++"));
+    });
+    // The build picks its own C++ headers.
+    check(&|_, build| {
+        build.flag("-nostdinc++");
+    });
+    check(&|_, build| {
+        build.flag("-nostdinc");
+    });
+    // Targets that don't link libstdc++ by default.
+    check(&|_, build| {
+        build.target("aarch64-linux-android");
+    });
+    check(&|_, build| {
+        build.target("x86_64-unknown-freebsd");
+    });
+    check(&|_, build| {
+        build.target("wasm32-unknown-unknown");
+    });
+
+    let mut test = Test::clang();
+    test.collect_cpp_stdlib_probes();
+    test.env.set("CXXSTDLIB", "stdc++");
+    cc::emit_link_directives(&libcxx_clang_build(&test), library(&test));
+    assert!(test.get_cpp_stdlib_probes(0).is_none(), "the probe ran");
+    drop(test);
+
+    let mut test = Test::clang();
+    test.collect_cpp_stdlib_probes();
+    test.env.set("CC_FORCE_DISABLE", "1");
+    cc::emit_link_directives(&libcxx_clang_build(&test), library(&test));
+    assert!(test.get_cpp_stdlib_probes(0).is_none(), "the probe ran");
+}
+
+/// Guard test: like family detection, the C++ stdlib probe only sends its
+/// stderr and its failure to the build's logger with debug output.
+#[test]
+fn cpp_stdlib_probe_logs_nothing() {
+    use cc::{BuildMessage, BuildMessageKind, BuildMessageLogger};
+    use std::{
+        any::Any,
+        sync::{Arc, Mutex},
+    };
+
+    struct Messages(Mutex<Vec<String>>);
+
+    impl BuildMessageLogger for Messages {
+        fn log(&self, _: BuildMessageKind, msg: BuildMessage<'_>, _: &dyn Any) {
+            self.0.lock().unwrap().push(msg.to_string());
+        }
+    }
+
+    let mut test = Test::clang();
+    test.collect_cpp_stdlib_probes();
+    let messages = Arc::new(Messages(Mutex::new(Vec::new())));
+    let mut build = clang_cpp_build(&test, None);
+    build
+        .cargo_debug(false)
+        .cargo_warnings(false)
+        .message_logger(Some(messages.clone()));
+    cc::emit_link_directives(&build, test.td.path().join("libfoo.a"));
+    assert!(test.get_cpp_stdlib_probes(0).is_some(), "no probe ran");
+    let messages = messages.0.lock().unwrap();
+    assert!(
+        messages
+            .iter()
+            .all(|msg| !msg.contains("detect_cpp_stdlib") && !msg.contains("cannot preprocess")),
+        "{messages:?}"
+    );
+}
+
 /// A clone shares the flag support cache with the `Build` it was cloned from,
 /// so an answer may only be reused for a probe that would run the same way.
 #[test]
@@ -2222,12 +2902,12 @@ fn flag_support_cache_is_per_language() {
 #[test]
 fn flag_support_cache_is_per_process_env() {
     let mut test = Test::gnu();
-    test.env.remove("CC_SHIM_FAIL_IF_ARG");
-    let mut build = test.gcc();
+    test.process_env.remove("CC_SHIM_FAIL_IF_ARG");
+    let mut build = test.gcc_with_process_env();
     build.compiler(test.td.path().join("cc"));
     let later = build.clone();
     assert!(build.is_flag_supported("-Wprobed").unwrap());
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
     assert!(
         !later.is_flag_supported("-Wprobed").unwrap(),
         "the answer was reused for a clone that inherited another environment"
@@ -2238,8 +2918,8 @@ fn flag_support_cache_is_per_process_env() {
 #[test]
 fn env_snapshot_is_taken_on_first_read() {
     let mut test = Test::gnu();
-    let mut build = test.gcc();
-    test.env.set("CFLAGS", "-Dset_after_new");
+    let mut build = test.gcc_with_process_env();
+    test.process_env.set("CFLAGS", "-Dset_after_new");
     build.file("foo.c").compile("foo");
     test.cmd(0).must_have("-Dset_after_new");
 }
@@ -2249,14 +2929,14 @@ fn env_snapshot_is_taken_on_first_read() {
 #[test]
 fn env_snapshot_ignores_later_changes() {
     let mut test = Test::gnu();
-    test.env.remove("CC_SHIM_FAIL_IF_ARG");
-    let mut build = test.gcc();
+    test.process_env.remove("CC_SHIM_FAIL_IF_ARG");
+    let mut build = test.gcc_with_process_env();
     build.file("foo.c").flag_if_supported("-Wprobed");
     build.try_get_compiler().unwrap();
     // Read by cc.
-    test.env.set("CFLAGS", "-Dset_after_first_read");
+    test.process_env.set("CFLAGS", "-Dset_after_first_read");
     // Read by the compiler: the shim fails on this argument.
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
     build.try_compile("foo").unwrap();
     test.cmd(0)
         .must_have("-Wprobed")
@@ -2267,11 +2947,11 @@ fn env_snapshot_ignores_later_changes() {
 #[test]
 fn env_snapshot_restores_changed_variables() {
     let mut test = Test::gnu();
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "-Dnot_passed");
-    let mut build = test.gcc();
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "-Dnot_passed");
+    let mut build = test.gcc_with_process_env();
     build.file("foo.c");
     build.try_get_compiler().unwrap();
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "foo.c");
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "foo.c");
     build.try_compile("foo").unwrap();
 }
 
@@ -2279,8 +2959,8 @@ fn env_snapshot_restores_changed_variables() {
 #[test]
 fn env_snapshot_is_overridden_by_build_env() {
     let mut test = Test::gnu();
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "foo.c");
-    let mut build = test.gcc();
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "foo.c");
+    let mut build = test.gcc_with_process_env();
     build.file("foo.c");
     build.try_get_compiler().unwrap();
     build.env("CC_SHIM_FAIL_IF_ARG", "-Dnot_passed");
@@ -2292,11 +2972,11 @@ fn env_snapshot_is_overridden_by_build_env() {
 #[test]
 fn env_snapshot_of_clones() {
     let mut test = Test::gnu();
-    let mut build = test.gcc();
+    let mut build = test.gcc_with_process_env();
     build.file("foo.c");
     let before = build.clone();
     build.try_get_compiler().unwrap();
-    test.env.set("CFLAGS", "-Dset_after_first_read");
+    test.process_env.set("CFLAGS", "-Dset_after_first_read");
     let after = build.clone();
 
     after.compile_intermediates();
@@ -2313,6 +2993,7 @@ fn env_snapshot_keeps_msvc_tool_env() {
     use std::ffi::OsStr;
 
     let mut test = Test::new();
+    test.clear_process_env();
     let mut build = cc::Build::new();
     build
         .target("x86_64-pc-windows-msvc")
@@ -2327,12 +3008,12 @@ fn env_snapshot_keeps_msvc_tool_env() {
             .collect::<Vec<_>>()
     };
     let tool = build.get_compiler();
-    let tool_path = path_of(tool.env().iter().map(|(k, v)| (&**k, Some(&**v))).collect());
+    let tool_path = path_of(tool.get_envs().map(|(k, v)| (k, Some(v))).collect());
     if tool_path.is_empty() {
         // No Visual Studio found.
         return;
     }
-    test.env.set("PATH", test.td.path());
+    test.process_env.set("PATH", test.td.path());
     let cmd = build.get_compiler().to_command();
     assert_eq!(path_of(cmd.get_envs().collect()), tool_path);
 }
@@ -2341,10 +3022,10 @@ fn env_snapshot_keeps_msvc_tool_env() {
 #[test]
 fn env_snapshot_reaches_archiver() {
     let mut test = Test::gnu();
-    let mut build = test.gcc();
+    let mut build = test.gcc_with_process_env();
     build.file("foo.c").ar_flag("--marker");
     build.try_get_compiler().unwrap();
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "--marker");
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "--marker");
     build.try_compile("foo").unwrap();
 }
 
@@ -2353,12 +3034,12 @@ fn env_snapshot_reaches_archiver() {
 #[test]
 fn env_snapshot_reaches_flag_support_probe() {
     let mut test = Test::gnu();
-    test.env.remove("CC_SHIM_FAIL_IF_ARG");
+    test.process_env.remove("CC_SHIM_FAIL_IF_ARG");
     test.collect_flag_supported_probes();
-    let build = test.gcc();
+    let build = test.gcc_with_process_env();
     build.try_get_compiler().unwrap();
-    test.env.set("CFLAGS", "-Dset_after_first_read");
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
+    test.process_env.set("CFLAGS", "-Dset_after_first_read");
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "-Wprobed");
     assert!(build.is_flag_supported("-Wprobed").unwrap());
     test.get_flag_supported_probes(0)
         .must_have("-Wprobed")
@@ -2379,17 +3060,17 @@ fn env_snapshot_reaches_cross_archiver_probe() {
         "TARGET_AR",
         "CC_SHIM_FAIL_IF_ARG",
     ] {
-        test.env.remove(var);
+        test.process_env.remove(var);
     }
     // The probe doesn't get `Build::env`, so the shim has to be on the
     // inherited `PATH`.
-    test.env.set("PATH", test.td.path());
-    let mut build = test.gcc();
+    test.process_env.set("PATH", test.td.path());
+    let mut build = test.gcc_with_process_env();
     build
         .target("aarch64-unknown-linux-gnu")
         .host("x86_64-unknown-linux-gnu");
     build.try_get_compiler().unwrap();
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "--version");
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "--version");
     let archiver = build.try_get_archiver().unwrap();
     assert_eq!(archiver.get_program(), "aarch64-linux-gnu-ar");
 }
@@ -2406,15 +3087,15 @@ fn env_snapshot_reaches_android_archiver_probe() {
         "TARGET_AR",
         "CC_SHIM_FAIL_IF_ARG",
     ] {
-        test.env.remove(var);
+        test.process_env.remove(var);
     }
-    let mut build = test.gcc();
+    let mut build = test.gcc_with_process_env();
     build
         .target("aarch64-linux-android")
         .host("x86_64-unknown-linux-gnu")
         .compiler(test.td.path().join("cc"));
     build.try_get_compiler().unwrap();
-    test.env.set("CC_SHIM_FAIL_IF_ARG", "--version");
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "--version");
     let archiver = build.try_get_archiver().unwrap();
     assert_eq!(archiver.get_program(), "llvm-ar");
 }
@@ -2430,17 +3111,17 @@ fn env_snapshot_reaches_android_compiler_probe() {
         "CC_aarch64_linux_android",
         "TARGET_CC",
     ] {
-        test.env.remove(var);
+        test.process_env.remove(var);
     }
     // The probe doesn't get `Build::env`, so the shim has to be on the
     // inherited `PATH`.
-    test.env.set("PATH", test.td.path());
-    let mut build = test.gcc();
+    test.process_env.set("PATH", test.td.path());
+    let mut build = test.gcc_with_process_env();
     build
         .target("aarch64-linux-android")
         .host("x86_64-unknown-linux-gnu");
     build.try_get_compiler().unwrap();
-    test.env.set("PATH", test.td.path().join("empty"));
+    test.process_env.set("PATH", test.td.path().join("empty"));
     let compiler = build.try_get_compiler().unwrap();
     // Not found, cc would fall back to `aarch64-linux-android-clang`. On
     // Windows it also turns either name into `gcc.exe` or `clang.exe`.
@@ -2454,7 +3135,7 @@ fn env_snapshot_reaches_family_detection() {
     let mut test = Test::gnu();
     // The probe resolves `cc` through the inherited `PATH`, so this `Build`
     // doesn't set one with `Build::env`.
-    test.env.set("PATH", test.td.path());
+    test.process_env.set("PATH", test.td.path());
     let probe_record = test.td.path().join("family-detection");
     let mut build = cc::Build::new();
     build
@@ -2464,8 +3145,10 @@ fn env_snapshot_reaches_family_detection() {
         .out_dir(test.td.path())
         .compiler("cc")
         .env("CC_SHIM_OUT_FILES_FOR_FAMILY_DETECTION", &probe_record);
-    build.try_flags_from_environment("CFLAGS").unwrap();
-    test.env.set("PATH", test.td.path().join("empty"));
+    // Takes the snapshot while `PATH` has the shim, whether `CFLAGS` is set or
+    // not.
+    let _ = build.try_flags_from_environment("CFLAGS");
+    test.process_env.set("PATH", test.td.path().join("empty"));
     build.try_get_compiler().unwrap();
     assert!(probe_record.exists());
 }
@@ -2504,12 +3187,12 @@ fn flag_support_cache_is_per_host() {
     ] {
         test.env.remove(var);
     }
+    test.env.set("TARGET_CFLAGS", "-m32");
     let mut build = test.gcc();
     build
         .compiler(test.td.path().join("cc"))
         .target("x86_64-unknown-linux-gnu")
         .host("x86_64-unknown-linux-gnu");
-    test.env.set("TARGET_CFLAGS", "-m32");
     build.env("CC_SHIM_FAIL_IF_ARG", "-m32");
     assert!(build.is_flag_supported("-Wprobed").unwrap());
     let mut cross = build.clone();
@@ -2518,6 +3201,133 @@ fn flag_support_cache_is_per_host() {
         !cross.is_flag_supported("-Wprobed").unwrap(),
         "the clone reused the answer probed for another host"
     );
+}
+
+/// cc looks up its own variables in the snapshot it is given, and the tools it
+/// runs don't get the process environment either.
+#[test]
+fn set_envs_snapshot_replaces_process_env() {
+    let mut test = Test::gnu();
+    let mut build = test.gcc_with_process_env();
+    test.process_env.set("CFLAGS", "-Dfrom_process_env");
+    // The shim fails if it gets this.
+    test.process_env.set("CC_SHIM_FAIL_IF_ARG", "foo.c");
+    build
+        .set_envs_snapshot([("CFLAGS", "-Dfrom_snapshot")])
+        .file("foo.c")
+        .try_compile("foo")
+        .unwrap();
+    test.cmd(0)
+        .must_have("-Dfrom_snapshot")
+        .must_not_have("-Dfrom_process_env");
+}
+
+/// The tools cc runs, here the compiler and then the archiver, get the
+/// snapshot, with `Build::env` on top.
+#[test]
+fn set_envs_snapshot_reaches_tools_under_build_env() {
+    let mut test = Test::gnu();
+    for fail_on in ["foo.c", "--marker"] {
+        let mut build = test.gcc_with_process_env();
+        build
+            .set_envs_snapshot([("CC_SHIM_FAIL_IF_ARG", fail_on)])
+            .file("foo.c")
+            .ar_flag("--marker")
+            // Forwarded stderr is written to stdout directly, past the test
+            // harness's capture.
+            .cargo_warnings(false);
+        let error = build.try_compile("foo").unwrap_err().to_string();
+        assert!(
+            error.contains("command did not execute successfully") && error.contains(fail_on),
+            "{error}"
+        );
+        build.env("CC_SHIM_FAIL_IF_ARG", "-Dnot_passed");
+        build.try_compile("foo").unwrap();
+    }
+}
+
+/// A second call replaces the snapshot rather than adding to it.
+#[test]
+fn set_envs_snapshot_replaces_earlier_call() {
+    let mut test = Test::gnu();
+    test.gcc_with_process_env()
+        .set_envs_snapshot([("CFLAGS", "-Dfirst")])
+        .set_envs_snapshot([("HOST_CFLAGS", "-Dsecond")])
+        .file("foo.c")
+        .try_compile("foo")
+        .unwrap();
+    test.cmd(0).must_have("-Dsecond").must_not_have("-Dfirst");
+}
+
+/// A call after the `Build` has copied the process environment replaces that
+/// copy.
+#[test]
+fn set_envs_snapshot_after_first_read() {
+    let mut test = Test::gnu();
+    let mut build = test.gcc_with_process_env();
+    test.process_env.set("CFLAGS", "-Dfrom_process_env");
+    build.file("foo.c");
+    build.try_get_compiler().unwrap();
+    build.set_envs_snapshot([("CFLAGS", "-Dfrom_snapshot")]);
+    build.try_compile("foo").unwrap();
+    test.cmd(0)
+        .must_have("-Dfrom_snapshot")
+        .must_not_have("-Dfrom_process_env");
+}
+
+/// The flag support cache is keyed on the snapshot, so a clone given another
+/// one probes again, and the original keeps its own answer.
+#[test]
+fn set_envs_snapshot_is_part_of_flag_support_cache_key() {
+    let test = Test::gnu();
+    let mut build = test.gcc();
+    build.compiler(test.td.path().join("cc"));
+    assert!(build.is_flag_supported("-Wprobed").unwrap());
+
+    let mut rejecting = build.clone();
+    rejecting.set_envs_snapshot([("CC_SHIM_FAIL_IF_ARG", "-Wprobed")]);
+    assert!(
+        !rejecting.is_flag_supported("-Wprobed").unwrap(),
+        "the answer probed with another snapshot was reused"
+    );
+    assert!(
+        build.is_flag_supported("-Wprobed").unwrap(),
+        "the clone's snapshot reached the original"
+    );
+}
+
+/// A variable given twice takes its last value, for cc as for the tools it
+/// runs.
+#[test]
+fn set_envs_snapshot_last_value_wins() {
+    let mut test = Test::gnu();
+    test.gcc_with_process_env()
+        .set_envs_snapshot([
+            ("CFLAGS", "-Dfirst"),
+            ("CC_SHIM_FAIL_IF_ARG", "foo.c"),
+            ("CFLAGS", "-Dlast"),
+            ("CC_SHIM_FAIL_IF_ARG", "-Dnot_passed"),
+        ])
+        .file("foo.c")
+        .try_compile("foo")
+        .unwrap();
+    test.cmd(0).must_have("-Dlast").must_not_have("-Dfirst");
+}
+
+/// The variables Cargo sets are still read from the process environment.
+#[test]
+fn set_envs_snapshot_leaves_cargo_variables() {
+    let mut test = Test::gnu();
+    let from_process_env = test.td.path().join("from_process_env");
+    test.process_env.set("OUT_DIR", &from_process_env);
+    let objects = test
+        .gcc_without_out_dir()
+        .set_envs_snapshot([("OUT_DIR", test.td.path().join("from_snapshot"))])
+        .file("foo.c")
+        .try_compile_intermediates()
+        .unwrap();
+    assert_eq!(objects.len(), 1);
+    assert!(objects[0].starts_with(&from_process_env), "{objects:?}");
 }
 
 #[test]
@@ -2556,6 +3366,41 @@ fn msvc_create_archive() {
     test.cmd(1).must_have(out).must_have(&objects[0]);
     // As with `compile`, the library is also available as `foo.lib`.
     assert!(test.td.path().join("foo.lib").is_file());
+}
+
+#[test]
+fn msvc_llvm_ar_name_ignores_case() {
+    let test = Test::msvc();
+    test.shim("LLVM-AR");
+    test.gcc()
+        .archiver(test.td.path().join("LLVM-AR"))
+        .file("foo.c")
+        .compile("foo");
+
+    // llvm-ar takes `ar` style arguments, not `lib.exe` style ones.
+    test.cmd(1)
+        .must_run("LLVM-AR")
+        .must_have("cqD")
+        .must_not_have("-nologo");
+}
+
+#[test]
+fn msvc_llvm_ar_check_ignores_folder_name() {
+    let test = Test::msvc();
+    let llvm_bin = test.td.path().join("llvm-arm64").join("bin");
+    std::fs::create_dir_all(&llvm_bin).unwrap();
+    let llvm_lib = format!("llvm-lib{}", env::consts::EXE_SUFFIX);
+    std::fs::copy(&test.gcc, llvm_bin.join(llvm_lib)).unwrap();
+    test.gcc()
+        .archiver(llvm_bin.join("llvm-lib"))
+        .file("foo.c")
+        .compile("foo");
+
+    // Only the file name tells whether the archiver is llvm-ar.
+    test.cmd(1)
+        .must_run("llvm-lib")
+        .must_have("-nologo")
+        .must_not_have("cqD");
 }
 
 #[test]
@@ -2687,20 +3532,20 @@ fn create_archive_and_emit_link_directives_match_compile() {
     }
 
     let run = |target: &str, how: &str| -> Vec<String> {
-        let output = Command::new(env::current_exe().unwrap())
-            .env("__CC_TEST_SPLIT_COMPILE", format!("{target} {how}"))
-            .env("PAUTHTEST_SYSROOT", "sysroot")
-            .env("PAUTHTEST_RESOURCE_DIR", "resource-dir")
-            .env_remove("CXXSTDLIB")
-            .env_remove("CXXSTDLIB_STATIC")
-            .env_remove("CC_ENABLE_DEBUG_OUTPUT")
-            .args([
-                "--exact",
-                "create_archive_and_emit_link_directives_match_compile",
-                "--nocapture",
-            ])
-            .output()
-            .unwrap();
+        let output = GlobalEnv::output(
+            Command::new(env::current_exe().unwrap())
+                .env("__CC_TEST_SPLIT_COMPILE", format!("{target} {how}"))
+                .env("PAUTHTEST_SYSROOT", "sysroot")
+                .env("PAUTHTEST_RESOURCE_DIR", "resource-dir")
+                .env_remove("CXXSTDLIB")
+                .env_remove("CXXSTDLIB_STATIC")
+                .env_remove("CC_ENABLE_DEBUG_OUTPUT")
+                .args([
+                    "--exact",
+                    "create_archive_and_emit_link_directives_match_compile",
+                    "--nocapture",
+                ]),
+        );
         assert!(output.status.success(), "subprocess failed: {:?}", output);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let out_dir = stdout

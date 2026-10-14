@@ -12,10 +12,10 @@ use std::process::ExitCode;
 
 /// Test-only environment variable naming a directory to record invocations in.
 ///
-/// Arguments are written to the first `out{i}` in it that does not exist yet, so
-/// a test reads the `i`-th invocation back with `Test::cmd(i)`. `Test::gcc()`
-/// sets this through `Build::env`, and the compile and archive commands that a
-/// build actually runs inherit it.
+/// The program and its arguments are written to the first `out{i}` in it that
+/// does not exist yet, so a test reads the `i`-th invocation back with
+/// `Test::cmd(i)`. `Test::gcc()` sets this through `Build::env`, and the
+/// compile and archive commands that a build actually runs inherit it.
 const OUT_DIR: &str = "CC_SHIM_OUT_DIR";
 
 /// Test-only environment variable naming an explicit `PATH`-separated list of
@@ -29,6 +29,14 @@ const OUT_DIR: &str = "CC_SHIM_OUT_DIR";
 /// and cannot shift the `out{i}` numbering of the invocations it is asserting
 /// on. See `set_probe_env` in `src/command_helpers.rs`.
 const OUT_FILES: &str = "CC_SHIM_OUT_FILES";
+
+/// Test-only environment variable holding what to print when asked to
+/// preprocess with `-E`, instead of declining.
+///
+/// cc sets this on one class of its probing invocations, renamed from the
+/// dedicated `CC_SHIM_STDOUT_FOR_*` variable the same way as [`OUT_FILES`], so a
+/// test can answer that probe without changing what the others see.
+const STDOUT: &str = "CC_SHIM_STDOUT";
 
 /// Create the file this invocation should record its arguments in, if any.
 ///
@@ -68,7 +76,8 @@ fn create_out_file(program: &str) -> Option<(PathBuf, File)> {
     )
 }
 
-/// Record the args passed to the command, if this invocation records at all.
+/// Record the program the shim runs as, then the args passed to it, if this
+/// invocation records at all.
 fn record(program: &str, args: &[String]) {
     let Some((candidate, f)) = create_out_file(program) else {
         return;
@@ -76,6 +85,7 @@ fn record(program: &str, args: &[String]) {
     let mut f = io::BufWriter::new(f);
 
     (|| {
+        writeln!(f, "{program}")?;
         for arg in args {
             writeln!(f, "{arg}")?;
         }
@@ -110,8 +120,13 @@ fn main() -> ExitCode {
     // This used to happen by accident: detection ran with a fresh environment,
     // so the shim panicked on the missing `CC_SHIM_OUT_DIR` instead. It is
     // spelled out now that detection runs in the environment the compile
-    // commands run in and reaches the shim on purpose.
+    // commands run in and reaches the shim on purpose. A test can still answer
+    // one class of probe with `CC_SHIM_STDOUT`.
     if args.iter().any(|a| a.as_str() == "-E") {
+        if let Some(stdout) = env::var_os(STDOUT) {
+            print!("{}", stdout.to_string_lossy());
+            return ExitCode::SUCCESS;
+        }
         eprintln!("{program}: the shim cannot preprocess");
         return ExitCode::FAILURE;
     }
