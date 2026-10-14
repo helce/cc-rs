@@ -4832,7 +4832,7 @@ fn split_off_msvc_linker_flags<T: AsRef<OsStr>>(family: ToolFamily, flags: &[T])
         ToolFamily::Msvc { .. } => flags
             .iter()
             .position(|flag| is_msvc_link_flag(flag.as_ref())),
-        ToolFamily::Gnu | ToolFamily::Clang { .. } => None,
+        ToolFamily::Gnu { .. } | ToolFamily::Clang { .. } => None,
     };
     flags.split_at(start.unwrap_or(flags.len()))
 }
