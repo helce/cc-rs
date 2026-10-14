@@ -246,6 +246,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use shlex::Shlex;
@@ -368,6 +369,7 @@ struct BuildCache {
     cached_compiler_family: RwLock<CompilerFamilyLookupCache>,
     known_flag_support_status_cache: RwLock<HashMap<CompilerFlag, bool>>,
     target_info_parser: target::TargetInfoParser,
+    warned_about_msvc_linker_flags: AtomicBool,
 }
 
 /// A builder for compilation of a native library.
@@ -866,6 +868,12 @@ impl Build {
     /// 2. Else if the `CXXSTDLIB` environment variable is set, use its value.
     /// 3. Else the default is `c++` for OS X and BSDs, `c++_shared` for Android,
     ///    `None` for MSVC and `stdc++` for anything else.
+    ///
+    /// On MSVC this also passes `-Tp` immediately before each `.cc` source file
+    /// to ensure that they are compiled as C++ rather than assumed to be
+    /// object files. The per-file form is used instead of `/TP`, which would
+    /// compile every following input as C++. clang-cl recognizes `.cc` itself
+    /// and is not passed `-Tp`.
     pub fn cpp(&mut self, cpp: bool) -> &mut Build {
         self.cpp = cpp;
         self
@@ -1576,6 +1584,12 @@ impl Build {
             return Ok(is_supported);
         }
 
+        // The probe build drops `/link` in `try_get_compiler`, so it would
+        // compile fine and wrongly report `/link` as supported.
+        if tool.is_like_msvc() && is_msvc_link_flag(flag) {
+            return Ok(false);
+        }
+
         let probe = self.flag_support_probe_files()?;
 
         let mut compiler = {
@@ -1980,7 +1994,40 @@ impl Build {
             cmd.arg("--device-c");
         }
         if is_asm {
-            cmd.args(self.asm_flags.iter().map(std::ops::Deref::deref));
+            cmd.args(self.asm_flags.iter().map(core::ops::Deref::deref));
+        }
+
+        self.add_compile_source_arg(&mut cmd, &compiler, &obj.src, is_assembler_msvc);
+
+        if cfg!(target_os = "macos") {
+            self.fix_env_for_apple_os(&mut cmd)?;
+        }
+
+        Ok(cmd)
+    }
+
+    /// Append a source path to `cmd`, using MSVC's per-file `-Tp` for `.cc`
+    /// sources so they are not treated as objects.
+    ///
+    /// `-Tp` applies only to the immediately following file, unlike `/TP` which
+    /// would compile every subsequent input as C++ (including C sources).
+    /// clang-cl recognizes `.cc` and is not passed `-Tp` (it uses `--` instead).
+    fn add_compile_source_arg(
+        &self,
+        cmd: &mut Command,
+        compiler: &Tool,
+        src: &Path,
+        is_assembler_msvc: bool,
+    ) {
+        if self.cpp
+            && src.extension() == Some(OsStr::new("cc"))
+            && matches!(compiler.family, ToolFamily::Msvc { clang_cl: false })
+        {
+            // MSVC recognizes only `.c` / `.cpp` / `.cxx` as source. A `.cc`
+            // file (mimalloc 0.1.52 writes `OUT_DIR/mimalloc-static.cc`) is
+            // assumed to be an object unless `-Tp` forces C++ compilation
+            // (#1877).
+            cmd.arg("-Tp");
         }
 
         if compiler.supports_path_delimiter() && !is_assembler_msvc {
@@ -1990,13 +2037,7 @@ impl Build {
             // `-Wslash-u-filename` warning.
             cmd.arg("--");
         }
-        cmd.arg(&obj.src);
-
-        if cfg!(target_os = "macos") {
-            self.fix_env_for_apple_os(&mut cmd)?;
-        }
-
-        Ok(cmd)
+        cmd.arg(src);
     }
 
     /// This will return a result instead of panicking; see [`Self::expand()`] for
@@ -2014,21 +2055,30 @@ impl Build {
         let is_asm = self
             .files
             .iter()
-            .map(std::ops::Deref::deref)
+            .map(core::ops::Deref::deref)
             .find_map(AsmFileExt::from_path)
             .is_some();
 
-        if compiler.family == (ToolFamily::Msvc { clang_cl: true }) && !is_asm {
-            // #513: For `clang-cl`, separate flags/options from the input file.
-            // When cross-compiling macOS -> Windows, this avoids interpreting
-            // common `/Users/...` paths as the `/U` flag and triggering
-            // `-Wslash-u-filename` warning.
-            cmd.arg("--");
+        for src in self.files.iter().map(std::ops::Deref::deref) {
+            self.add_compile_source_arg(&mut cmd, &compiler, src, is_asm);
         }
 
-        cmd.args(self.files.iter().map(std::ops::Deref::deref));
+        // cl.exe echoes the name of the file it compiles on stderr. That is
+        // not a warning, so don't forward it as one (#896).
+        let echoed_file_name = if matches!(compiler.family, ToolFamily::Msvc { clang_cl: false }) {
+            self.files
+                .first()
+                .and_then(|src| src.file_name())
+                .and_then(OsStr::to_str)
+        } else {
+            None
+        };
 
-        run_output(&mut cmd, &self.cargo_output)
+        run_output_ignoring_line(
+            &mut cmd,
+            &self.cargo_output,
+            echoed_file_name.map(str::as_bytes),
+        )
     }
 
     /// Run the compiler, returning the macro-expanded version of the input files.
@@ -2173,10 +2223,17 @@ impl Build {
 
         // Set flags configured in the builder (do this second-to-last, to allow these to override
         // everything above).
-        for flag in self.flags.iter() {
+        let (flags, linker_flags) = split_off_msvc_linker_flags(cmd.family, &self.flags);
+        let mut ignored_flags: Vec<&OsStr> = linker_flags.iter().map(|f| &**f).collect();
+        for flag in flags {
             cmd.args.push((**flag).into());
         }
-        for flag in self.flags_supported.iter() {
+        // Like `self.flags` above, drop `/link` and the entries after it in
+        // this list without probing them.
+        let (flags_supported, linker_flags) =
+            split_off_msvc_linker_flags(cmd.family, &self.flags_supported);
+        ignored_flags.extend(linker_flags.iter().map(|f| &**f));
+        for flag in flags_supported {
             if self
                 .is_flag_supported_inner(flag, &cmd, &target)
                 .unwrap_or(false)
@@ -2194,9 +2251,24 @@ impl Build {
 
         // Set flags from the environment (do this last, to allow these to override everything else).
         if let Some(flags) = &envflags {
+            let (flags, linker_flags) = split_off_msvc_linker_flags(cmd.family, flags);
+            ignored_flags.extend(linker_flags.iter().map(OsStr::new));
             for arg in flags {
                 cmd.push_cc_arg(arg.into());
             }
+        }
+
+        if !ignored_flags.is_empty()
+            && !self
+                .build_cache
+                .warned_about_msvc_linker_flags
+                .swap(true, Ordering::Relaxed)
+        {
+            self.cargo_output.print_warning(&format_args!(
+                "Ignoring {ignored_flags:?}: cl passes `/link` and the arguments after it to the \
+                linker, but cc only compiles. Use `cargo:rustc-link-arg` for linker flags, and \
+                `/Zl` instead of `/link /NODEFAULTLIB`."
+            ));
         }
 
         // Set custom env vars that the user specified with `Build::env`.
@@ -3024,7 +3096,7 @@ impl Build {
         let mut objs = objs
             .iter()
             .map(|o| o.dst.as_path())
-            .chain(self.objects.iter().map(std::ops::Deref::deref))
+            .chain(self.objects.iter().map(core::ops::Deref::deref))
             .peekable();
         let mut batch = Vec::new();
         while objs.peek().is_some() {
@@ -4494,7 +4566,7 @@ impl Build {
             )
             .ok()?;
 
-            Some(Arc::from(std::str::from_utf8(&version).ok()?.trim()))
+            Some(Arc::from(core::str::from_utf8(&version).ok()?.trim()))
         };
 
         let deployment_from_env = |name: &str| -> Option<Arc<str>> {
@@ -4659,7 +4731,7 @@ impl Build {
         .ok()?;
         // clang driver appears to be forcing UTF-8 output even on Windows,
         // hence from_utf8 is assumed to be usable in all cases.
-        let search_dirs = std::str::from_utf8(&search_dirs).ok()?;
+        let search_dirs = core::str::from_utf8(&search_dirs).ok()?;
         for dirs in search_dirs.split(['\r', '\n']) {
             if let Some(path) = dirs.strip_prefix("programs: =") {
                 return self.which(prog, Some(OsStr::new(path)));
@@ -4749,6 +4821,26 @@ impl Default for Build {
     fn default() -> Build {
         Build::new()
     }
+}
+
+/// `cl` and `clang-cl` pass `/link` and every argument after it to the linker.
+/// cc only compiles, and appends the source file after the flags, so such flags
+/// would never reach a linker and would hide the source file from the compiler
+/// (#1331). Splits `flags` into the flags before `/link` and the rest.
+fn split_off_msvc_linker_flags<T: AsRef<OsStr>>(family: ToolFamily, flags: &[T]) -> (&[T], &[T]) {
+    let start = match family {
+        ToolFamily::Msvc { .. } => flags
+            .iter()
+            .position(|flag| is_msvc_link_flag(flag.as_ref())),
+        ToolFamily::Gnu | ToolFamily::Clang { .. } => None,
+    };
+    flags.split_at(start.unwrap_or(flags.len()))
+}
+
+/// Whether `flag` is the `/link` option of `cl` and `clang-cl`. clang-cl also
+/// accepts a joined `-link<args>` form, which this does not detect.
+fn is_msvc_link_flag(flag: &OsStr) -> bool {
+    matches!(flag.to_str(), Some("/link" | "-link"))
 }
 
 fn fail(s: &str) -> ! {

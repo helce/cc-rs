@@ -535,7 +535,9 @@ fn msvc_smoke() {
         .must_have("foo.c")
         .must_not_have("-Z7")
         .must_have("-c")
-        .must_have("-MD");
+        .must_have("-MD")
+        .must_not_have("-Tp")
+        .must_not_have("-TP");
     test.cmd(1)
         .must_have(test.td.path().join("db3b6bfb95261072-foo.o"));
 }
@@ -576,6 +578,80 @@ fn msvc_define() {
 }
 
 #[test]
+fn msvc_link_flag_is_ignored() {
+    // Regression test for issue #1331
+    // https://github.com/rust-lang/cc-rs/issues/1331
+    //
+    // cl passes `/link` and everything after it to the linker, so the source
+    // file would never reach the compiler. cc only compiles, so drop them.
+    let test = Test::msvc();
+    test.gcc()
+        .flag("/GS-")
+        .flag("/link")
+        .flag("/NODEFAULTLIB")
+        .define("FOO", None)
+        .file("foo.c")
+        .compile("foo");
+
+    test.cmd(0)
+        .must_have("/GS-")
+        .must_not_have("/link")
+        .must_not_have("/NODEFAULTLIB")
+        .must_have("-DFOO")
+        .must_have_in_order("-c", "foo.c");
+}
+
+#[test]
+fn clang_cl_link_flag_is_ignored() {
+    let test = Test::msvc();
+    test.shim("clang-cl");
+    test.gcc()
+        .compiler(test.td.path().join("clang-cl"))
+        .flag("-link")
+        .flag("/NODEFAULTLIB")
+        .file("foo.c")
+        .compile("foo");
+
+    test.cmd(0)
+        .must_not_have("-link")
+        .must_not_have("/NODEFAULTLIB")
+        .must_have("foo.c");
+}
+
+#[test]
+fn msvc_link_flag_if_supported_is_ignored() {
+    // `flag_if_supported("/link")` must not reach cl either. Each list of
+    // flags is cut at its own `/link`: the entries after it in the
+    // `flag_if_supported` list are dropped without being probed. `flag`
+    // entries are a separate list that cc puts before the `flag_if_supported`
+    // ones on the command line, so cl would never pass them to the linker, and
+    // they are kept.
+    let test = Test::msvc();
+    let mut build = test.gcc();
+    build
+        .flag("/GS-")
+        .flag_if_supported("/link")
+        .flag_if_supported("/NODEFAULTLIB")
+        .file("foo.c");
+    assert!(!build.is_flag_supported("/link").unwrap());
+    build.compile("foo");
+
+    test.cmd(0)
+        .must_have("/GS-")
+        .must_not_have("/link")
+        .must_not_have("/NODEFAULTLIB")
+        .must_have_in_order("-c", "foo.c");
+}
+
+#[test]
+fn gnu_link_flag_is_kept() {
+    let test = Test::gnu();
+    test.gcc().flag("/link").file("foo.c").compile("foo");
+
+    test.cmd(0).must_have("/link");
+}
+
+#[test]
 fn msvc_static_crt() {
     let test = Test::msvc();
     test.gcc().static_crt(true).file("foo.c").compile("foo");
@@ -605,6 +681,114 @@ fn msvc_std_c() {
     test.gcc().file("foo.c").std("c11").compile("foo");
 
     test.cmd(0).must_have("-std:c11");
+}
+
+#[test]
+fn msvc_cpp_cc_source_not_treated_as_object() {
+    // Regression test for issue #1877
+    // https://github.com/rust-lang/cc-rs/issues/1877
+    //
+    // MSVC does not recognize `.cc` as C++ (only `.cpp` / `.cxx`). Without
+    // `-Tp` it emits D9024 and treats the file as an object input, so the
+    // `-Fo` output (e.g. `*-mimalloc-static.o`) is never generated.
+    // libmimalloc-sys 0.1.49 writes `OUT_DIR/mimalloc-static.cc` when
+    // `cpp(true)` on MSVC. Use per-file `-Tp` only for `.cc` rather than `/TP`,
+    // which would compile every following input as C++.
+
+    let test = Test::msvc();
+    let src = test.td.path().join("mimalloc-static.cc");
+    let intermediates = test
+        .gcc()
+        .cpp(true)
+        .std("c++17")
+        .file(&src)
+        .compile_intermediates();
+
+    assert_eq!(intermediates.len(), 1);
+    assert!(
+        intermediates[0]
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("mimalloc-static.o")),
+        "object output should be derived from the `.cc` source, got {:?}",
+        intermediates[0]
+    );
+
+    test.cmd(0)
+        .must_have("-Tp")
+        .must_not_have("-TP")
+        .must_have("-std:c++17")
+        .must_have("-c")
+        .must_have(&src);
+
+    let compile_args = &test.cmd(0).args;
+    let src_pos = compile_args
+        .iter()
+        .position(|arg| std::path::Path::new(arg) == src.as_path())
+        .expect("`.cc` source should be passed to the compiler");
+    assert_eq!(
+        compile_args[src_pos - 1],
+        "-Tp",
+        "`.cc` must be the immediate argument to `-Tp`, not a positional object: {compile_args:?}"
+    );
+    assert!(
+        compile_args
+            .iter()
+            .any(|arg| arg.starts_with("-Fo") && arg.ends_with("mimalloc-static.o")),
+        "object output should be the `-Fo` destination: {compile_args:?}"
+    );
+    assert!(
+        !compile_args
+            .iter()
+            .any(|arg| arg.ends_with("mimalloc-static.o") && !arg.starts_with("-Fo")),
+        "object output path must not appear as a source: {compile_args:?}"
+    );
+}
+
+#[test]
+fn msvc_cpp_does_not_pass_tp_for_c_or_cpp() {
+    // `-Tp` is only required for `.cc`. Passing it (or `/TP`) for `.c` would
+    // compile C as C++.
+    let test = Test::msvc();
+    let c_src = test.td.path().join("foo.c");
+    let cpp_src = test.td.path().join("bar.cpp");
+    test.gcc()
+        .cpp(true)
+        .file(&c_src)
+        .file(&cpp_src)
+        .compile("foo");
+
+    test.cmd(0)
+        .must_have(&c_src)
+        .must_not_have("-Tp")
+        .must_not_have("/Tp")
+        .must_not_have("-TP");
+    test.cmd(1)
+        .must_have(&cpp_src)
+        .must_not_have("-Tp")
+        .must_not_have("/Tp")
+        .must_not_have("-TP");
+}
+
+#[test]
+fn clang_cl_cpp_cc_does_not_use_tp() {
+    // clang-cl recognizes `.cc` and uses `--` as a path delimiter. `-Tp` must
+    // not be passed after `--`, and is not needed before it.
+    let test = Test::msvc();
+    test.shim("clang-cl");
+    let src = test.td.path().join("mimalloc-static.cc");
+    test.gcc()
+        .compiler(test.td.path().join("clang-cl"))
+        .cpp(true)
+        .file(&src)
+        .compile_intermediates();
+
+    test.cmd(0)
+        .must_have(&src)
+        .must_have("--")
+        .must_not_have("-Tp")
+        .must_not_have("/Tp")
+        .must_not_have("-TP");
 }
 
 #[test]
@@ -812,7 +996,7 @@ fn clang_apple_mac_catalyst() {
     if !output.status.success() {
         return;
     }
-    let sdkroot = std::str::from_utf8(&output.stdout).unwrap().trim();
+    let sdkroot = core::str::from_utf8(&output.stdout).unwrap().trim();
 
     let test = Test::clang();
     test.gcc()
@@ -910,7 +1094,7 @@ fn apple_sdkroot_wrong() {
     dbg!(test.cmd(0).args);
 
     test.cmd(0)
-        .must_have(std::str::from_utf8(&output.stdout).unwrap().trim());
+        .must_have(core::str::from_utf8(&output.stdout).unwrap().trim());
     test.cmd(0).must_not_have(wrong_sdkroot);
 }
 
