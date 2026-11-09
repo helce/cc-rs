@@ -42,7 +42,7 @@ jobs:
             mingw64,
             windows-latest,
           ]
-        cargo_flags: ['', '--release', '--features parallel']
+        cargo_flags: ['', '--release', '--features parallel,compile-commands']
         include:
           - build: stable
             os: ubuntu-latest
@@ -246,7 +246,7 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         if: startsWith(matrix.build, 'windows-clang')
 
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         if: ${{ ! matrix.no_run }}
         with:
           tool: cargo-nextest
@@ -283,7 +283,7 @@ jobs:
            cache: false
            toolchain: stable
 
-       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
          with:
            tool: cargo-nextest
 
@@ -336,7 +336,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test -Z build-std=std --no-run --workspace --target ${{ matrix.target }}
       - run: cargo test -Z build-std=std --no-run --workspace --target ${{ matrix.target }} --release
-      - run: cargo test -Z build-std=std --no-run --workspace --target ${{ matrix.target }} --features parallel
+      - run: cargo test -Z build-std=std --no-run --workspace --target ${{ matrix.target }} --features parallel,compile-commands
       # check that there are no uncommitted changes to prevent bugs like https://github.com/rust-lang/cc-rs/issues/1411
       - name: check clean Git workting tree
         uses: ./.github/actions/check-clean-git-working-tree
@@ -361,7 +361,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --no-run --target ${{ matrix.target }}
       - run: cargo test --no-run --target ${{ matrix.target }} --release
-      - run: cargo test --no-run --target ${{ matrix.target }} --features parallel
+      - run: cargo test --no-run --target ${{ matrix.target }} --features parallel,compile-commands
       # check that there are no uncommitted changes to prevent bugs like https://github.com/rust-lang/cc-rs/issues/1411
       - name: check clean Git workting tree
         uses: ./.github/actions/check-clean-git-working-tree
@@ -470,7 +470,7 @@ jobs:
 
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
       - run: cargo update
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -479,6 +479,74 @@ jobs:
         run: |
           cargo nextest run --manifest-path dev-tools/cc-test/Cargo.toml --features test_cuda
           CXX=clang++ cargo nextest run --manifest-path dev-tools/cc-test/Cargo.toml --features test_cuda
+      # check that there are no uncommitted changes to prevent bugs like https://github.com/rust-lang/cc-rs/issues/1411
+      - name: check clean Git workting tree
+        uses: ./.github/actions/check-clean-git-working-tree
+
+  # Run C code that cc instruments for the sanitizer from `CARGO_CFG_SANITIZE`,
+  # in each configuration where cc passes the sanitizer on.
+  sanitizers:
+    name: Test sanitizers
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # This target turns on AddressSanitizer and has a prebuilt standard
+          # library for it. Nightly, since stable rustc leaves the `sanitize`
+          # cfg out of `--print cfg`, so Cargo doesn't set `CARGO_CFG_SANITIZE`.
+          - os: ubuntu-latest
+            rust: nightly
+            target: x86_64-unknown-linux-gnuasan
+            CC: gcc
+          - os: ubuntu-latest
+            rust: nightly
+            target: x86_64-unknown-linux-gnuasan
+            CC: clang
+          # The standard library isn't instrumented here, which is fine for
+          # checking the C code.
+          - os: windows-latest
+            rust: nightly
+            target: x86_64-pc-windows-msvc
+            RUSTFLAGS: -Zsanitizer=address -Cunsafe-allow-abi-mismatch=sanitizer
+    env:
+      CC: ${{ matrix.CC }}
+      RUSTFLAGS: ${{ matrix.RUSTFLAGS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: false
+          target: ${{ matrix.target }}
+          toolchain: ${{ matrix.rust }}
+      # Puts the MSVC AddressSanitizer runtime DLL on `PATH`.
+      - name: setup dev environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        if: runner.os == 'Windows'
+      # Bash steps put Git's `link` ahead of MSVC's `link.exe` on `PATH`, and
+      # with the dev environment set up rustc would run it.
+      - name: remove Git's link
+        if: runner.os == 'Windows'
+        shell: bash
+        run: rm /usr/bin/link.exe
+      - run: cargo update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Run without errors
+        shell: bash
+        run: cargo run -p sanitizer-test --target ${{ matrix.target }}
+      - name: Check that the sanitizer reports the error in the C code
+        shell: bash
+        run: |
+          if cargo run -p sanitizer-test --target ${{ matrix.target }} -- overflow 2> "$RUNNER_TEMP/stderr.txt"; then
+            cat "$RUNNER_TEMP/stderr.txt"
+            echo "the out of bounds read in the C code was not reported"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/stderr.txt"
+          grep -q "AddressSanitizer: heap-buffer-overflow" "$RUNNER_TEMP/stderr.txt"
       # check that there are no uncommitted changes to prevent bugs like https://github.com/rust-lang/cc-rs/issues/1411
       - name: check clean Git workting tree
         uses: ./.github/actions/check-clean-git-working-tree
@@ -510,7 +578,7 @@ jobs:
           cache: false
           target: ${{ env.TARGETS }}
           toolchain: ${{ env.MSRV }}
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: |
             cargo-hack
@@ -543,7 +611,7 @@ jobs:
           cache: false
           components: clippy
           toolchain: stable
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: |
             cargo-hack
@@ -567,7 +635,7 @@ jobs:
           cache: false
           components: rustfmt
           toolchain: stable
-      - uses: tombi-toml/setup-tombi@2a4ab856017ecce1511302ed241f571d1230a1d8 # v1.7.0
+      - uses: tombi-toml/setup-tombi@ebc771afde2bfb9192c91338a71b2c5d6152e2c3 # v1.8.4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check Rust formatting
         run: cargo fmt -- --check
@@ -596,6 +664,7 @@ jobs:
       - check-wasm
       - test-wasi
       - cuda
+      - sanitizers
       - msrv
       - clippy
       - check-format

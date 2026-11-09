@@ -22,7 +22,7 @@ fn gnu_smoke() {
         .must_have("-ffunction-sections")
         .must_have("-fdata-sections");
     test.cmd(1)
-        .must_have(test.td.path().join("db3b6bfb95261072-foo.o"));
+        .must_have(test.td.path().join("9bb0a3195b9dd27a-foo.o"));
 }
 
 #[test]
@@ -427,12 +427,35 @@ fn gnu_flag_if_supported() {
         .must_not_have("-Wflag-does-not-exist");
 }
 
+/// `flag` and `flag_if_supported` reach the command line in the order they
+/// were called in.
+/// <https://github.com/rust-lang/cc-rs/issues/855>
+#[test]
+fn flag_and_flag_if_supported_keep_order() {
+    let test = Test::gnu();
+    test.gcc()
+        .file("foo.c")
+        .env("CC_SHIM_FAIL_IF_ARG", "-Wflag-does-not-exist")
+        .flag_if_supported("-xc")
+        .flag("-xc++")
+        .flag_if_supported("-Wflag-does-not-exist")
+        .flag("-std=c++11")
+        .flag_if_supported("-Wshadow")
+        .compile("foo");
+
+    test.cmd(0)
+        .must_have_in_order("-xc", "-xc++")
+        .must_have_in_order("-xc++", "-std=c++11")
+        .must_have_in_order("-std=c++11", "-Wshadow")
+        .must_not_have("-Wflag-does-not-exist");
+}
+
 /// `flag_if_supported` must probe even when `OUT_DIR` is unset.
 /// <https://github.com/rust-lang/cc-rs/issues/1765>
 #[test]
 fn flag_if_supported_without_out_dir() {
     let mut test = Test::gnu();
-    test.process_env.remove("OUT_DIR");
+    test.env.remove("OUT_DIR");
     test.collect_flag_supported_probes();
 
     let compiler = test
@@ -514,9 +537,8 @@ fn gnu_crt_static_not_applied_when_target_overridden() {
     let mut test = Test::gnu();
     test.shim("x86_64-linux-musl-gcc")
         .shim("x86_64-linux-musl-ar");
-    test.process_env.set("TARGET", "x86_64-unknown-linux-musl");
-    test.process_env
-        .set("CARGO_CFG_TARGET_FEATURE", "crt-static");
+    test.env.set("TARGET", "x86_64-unknown-linux-musl");
+    test.env.set("CARGO_CFG_TARGET_FEATURE", "crt-static");
 
     // Case 1: Compiling for Cargo's TARGET -> crt-static triggers -static
     test.gcc()
@@ -530,9 +552,8 @@ fn gnu_crt_static_not_applied_when_target_overridden() {
     let mut test = Test::gnu();
     test.shim("x86_64-linux-gnu-gcc")
         .shim("x86_64-linux-gnu-ar");
-    test.process_env.set("TARGET", "x86_64-unknown-linux-musl");
-    test.process_env
-        .set("CARGO_CFG_TARGET_FEATURE", "crt-static");
+    test.env.set("TARGET", "x86_64-unknown-linux-musl");
+    test.env.set("CARGO_CFG_TARGET_FEATURE", "crt-static");
 
     // Case 2: Target is overridden (e.g. for HOST tools) -> crt-static must NOT apply
     test.gcc()
@@ -571,8 +592,7 @@ fn msvc_smoke() {
         .must_have("-MD")
         .must_not_have("-Tp")
         .must_not_have("-TP");
-    test.cmd(1)
-        .must_have(test.td.path().join("db3b6bfb95261072-foo.o"));
+    test.cmd(1).must_have("9bb0a3195b9dd27a-foo.o");
 }
 
 #[test]
@@ -653,12 +673,8 @@ fn clang_cl_link_flag_is_ignored() {
 
 #[test]
 fn msvc_link_flag_if_supported_is_ignored() {
-    // `flag_if_supported("/link")` must not reach cl either. Each list of
-    // flags is cut at its own `/link`: the entries after it in the
-    // `flag_if_supported` list are dropped without being probed. `flag`
-    // entries are a separate list that cc puts before the `flag_if_supported`
-    // ones on the command line, so cl would never pass them to the linker, and
-    // they are kept.
+    // `flag_if_supported("/link")` must not reach cl either, and the entries
+    // after it are dropped without being probed, the same as after `flag`.
     let test = Test::msvc();
     let mut build = test.gcc();
     build
@@ -668,6 +684,25 @@ fn msvc_link_flag_if_supported_is_ignored() {
         .file("foo.c");
     assert!(!build.is_flag_supported("/link").unwrap());
     build.compile("foo");
+
+    test.cmd(0)
+        .must_have("/GS-")
+        .must_not_have("/link")
+        .must_not_have("/NODEFAULTLIB")
+        .must_have_in_order("-c", "foo.c");
+}
+
+#[test]
+fn msvc_flag_after_link_flag_if_supported_is_ignored() {
+    // What comes after `/link` is meant for the linker whichever method
+    // added the `/link`, so a later `flag` is dropped as well.
+    let test = Test::msvc();
+    test.gcc()
+        .flag("/GS-")
+        .flag_if_supported("/link")
+        .flag("/NODEFAULTLIB")
+        .file("foo.c")
+        .compile("foo");
 
     test.cmd(0)
         .must_have("/GS-")
@@ -703,9 +738,8 @@ fn msvc_no_static_crt() {
 #[test]
 fn msvc_crt_static_not_applied_when_target_overridden() {
     let mut test = Test::msvc();
-    test.process_env.set("TARGET", "x86_64-pc-windows-msvc");
-    test.process_env
-        .set("CARGO_CFG_TARGET_FEATURE", "crt-static");
+    test.env.set("TARGET", "x86_64-pc-windows-msvc");
+    test.env.set("CARGO_CFG_TARGET_FEATURE", "crt-static");
 
     // Case 1: Compiling for Cargo's TARGET -> crt-static triggers -MT
     test.gcc()
@@ -717,9 +751,8 @@ fn msvc_crt_static_not_applied_when_target_overridden() {
     drop(test);
 
     let mut test = Test::msvc();
-    test.process_env.set("TARGET", "x86_64-pc-windows-msvc");
-    test.process_env
-        .set("CARGO_CFG_TARGET_FEATURE", "crt-static");
+    test.env.set("TARGET", "x86_64-pc-windows-msvc");
+    test.env.set("CARGO_CFG_TARGET_FEATURE", "crt-static");
 
     // Case 2: Target is overridden -> crt-static does not apply and defaults to -MD
     test.gcc()
@@ -1580,7 +1613,7 @@ fn out_dir_source_object_name_does_not_depend_on_build_path() {
 
     fn object_name(mut test: Test) -> std::ffi::OsString {
         let out_dir = test.td.path().to_path_buf();
-        test.process_env.set("OUT_DIR", &out_dir);
+        test.env.set("OUT_DIR", &out_dir);
         let intermediates = test
             .gcc()
             .file(out_dir.join("gen.c"))
@@ -1778,7 +1811,7 @@ mod msvc_prefer_clang_cl_env {
 
     /// A test with a `cl.exe` that cc finds through `VCINSTALLDIR`, and the
     /// path of that `cl.exe`.
-    fn test_with_cl_exe() -> (Test, PathBuf) {
+    pub(super) fn test_with_cl_exe() -> (Test, PathBuf) {
         let mut test = Test::msvc_autodetect();
         test.shim("cc");
         let vc = test.td.path().join("VC");
@@ -1844,6 +1877,60 @@ mod msvc_prefer_clang_cl_env {
     }
 }
 
+/// cc runs the `cl.exe` it finds itself through a compiler cache from
+/// `RUSTC_WRAPPER`, as it does a compiler from `CC`, and changes nothing else
+/// about it.
+#[test]
+fn msvc_rustc_wrapper_applies_to_found_cl_exe() {
+    // A Windows host finds the `cl.exe` of Visual Studio, other hosts the one
+    // in `VCINSTALLDIR`.
+    #[cfg(windows)]
+    let mut test = Test::msvc_autodetect();
+    #[cfg(not(windows))]
+    let (mut test, _) = msvc_prefer_clang_cl_env::test_with_cl_exe();
+
+    let found = test.gcc().cargo_warnings(false).get_compiler();
+    // A `cl.exe` that cc didn't find is a bare name, which gets the wrapper
+    // anyway.
+    assert!(found.path().is_absolute(), "{:?}", found.path());
+    assert!(found.is_like_msvc() && !found.is_like_clang_cl());
+    let found_cmd = found.to_command();
+    assert_eq!(found_cmd.get_program(), found.path());
+    // Outside a developer prompt, the variables Visual Studio's `cl.exe`
+    // needs come with it.
+    if cfg!(windows) && env::var_os("VCINSTALLDIR").is_none() {
+        for var in ["INCLUDE", "LIB"] {
+            assert!(found.get_envs().any(|(key, _)| key == var), "{var}");
+        }
+    }
+
+    // Only wrappers known to cache C compilers are used.
+    for wrapper in ["", "cargo-miri"] {
+        test.env.set("RUSTC_WRAPPER", wrapper);
+        let compiler = test.gcc().cargo_warnings(false).get_compiler();
+        assert_eq!(compiler.to_command().get_program(), found.path());
+    }
+
+    test.env.set("RUSTC_WRAPPER", "sccache");
+    let compiler = test.gcc().cargo_warnings(false).get_compiler();
+    assert_eq!(compiler.path(), found.path());
+    assert!(compiler.is_like_msvc() && !compiler.is_like_clang_cl());
+    assert!(compiler.get_envs().eq(found.get_envs()));
+    let cmd = compiler.to_command();
+    assert_eq!(cmd.get_program(), "sccache");
+    assert_eq!(
+        cmd.get_args().collect::<Vec<_>>(),
+        std::iter::once(found.path().as_os_str())
+            .chain(found_cmd.get_args())
+            .collect::<Vec<_>>()
+    );
+
+    // C++ uses the same `cl.exe`, through the wrapper too.
+    let cpp = test.gcc().cpp(true).cargo_warnings(false).get_compiler();
+    assert_eq!(cpp.path(), found.path());
+    assert_eq!(cpp.to_command().get_program(), "sccache");
+}
+
 /// cc tells Cargo to rerun the build script when `CC_PREFER_CLANG_CL_OVER_MSVC`
 /// changes, on MSVC targets only.
 #[test]
@@ -1879,6 +1966,365 @@ fn msvc_prefer_clang_cl_over_msvc_env_rerun() {
     };
     assert_eq!(rerun_lines("x86_64-pc-windows-msvc"), 1);
     assert_eq!(rerun_lines("x86_64-unknown-linux-gnu"), 0);
+}
+
+// The variables that compilers read by themselves, grouped by who reads them.
+/// GCC and Clang, clang-cl included.
+const GCC_AND_CLANG_ENV: &[&str] = &[
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "OBJC_INCLUDE_PATH",
+    "OBJCPLUS_INCLUDE_PATH",
+    "COMPILER_PATH",
+    "SOURCE_DATE_EPOCH",
+];
+const GCC_ENV: &[&str] = &["GCC_EXEC_PREFIX"];
+/// Clang in every driver mode.
+const CLANG_ENV: &[&str] = &["CCC_OVERRIDE_OPTIONS", "CLANG_NO_DEFAULT_CONFIG"];
+const ZIG_ENV: &[&str] = &["ZIG_LIB_DIR", "ZIG_LIBC"];
+/// cl.exe, and Clang on MSVC targets.
+const MSVC_INCLUDE_ENV: &[&str] = &["INCLUDE", "EXTERNAL_INCLUDE"];
+/// Clang on MSVC targets.
+const CLANG_MSVC_ENV: &[&str] = &["VCToolsInstallDir", "VCINSTALLDIR"];
+/// cl.exe and clang-cl.
+const CL_ENV: &[&str] = &["CL", "_CL_"];
+const CL_EXE_ENV: &[&str] = &["LIBPATH"];
+/// ml.exe and ml64.exe.
+const MASM_ENV: &[&str] = &["ML"];
+const NVCC_ENV: &[&str] = &["NVCC_PREPEND_FLAGS", "NVCC_APPEND_FLAGS", "NVCC_CCBIN"];
+/// nvcc on MSVC targets.
+const NVCC_MSVC_ENV: &[&str] = &["VSCMD_VER"];
+const EMCC_ENV: &[&str] = &[
+    "EMCC_CFLAGS",
+    "EMCC_LOCAL_PORTS",
+    "EM_CONFIG",
+    "EM_CACHE",
+    "EM_PORTS",
+    "EM_LLVM_ROOT",
+    "EM_CLANG_ADD_VERSION",
+    "EM_COMPILER_WRAPPER",
+];
+/// Apple targets and macOS hosts.
+const XCRUN_ENV: &[&str] = &["DEVELOPER_DIR", "TOOLCHAINS", "SDKROOT"];
+/// Apple targets.
+const APPLE_CLANG_ENV: &[&str] = &["RC_DEBUG_OPTIONS", "RC_DEBUG_PREFIX_MAP"];
+const DEPLOYMENT_TARGET_ENV: &[&str] = &[
+    "MACOSX_DEPLOYMENT_TARGET",
+    "IPHONEOS_DEPLOYMENT_TARGET",
+    "TVOS_DEPLOYMENT_TARGET",
+    "WATCHOS_DEPLOYMENT_TARGET",
+    "XROS_DEPLOYMENT_TARGET",
+];
+const COMPILER_ENV: &[&[&str]] = &[
+    GCC_AND_CLANG_ENV,
+    GCC_ENV,
+    CLANG_ENV,
+    ZIG_ENV,
+    MSVC_INCLUDE_ENV,
+    CLANG_MSVC_ENV,
+    CL_ENV,
+    CL_EXE_ENV,
+    MASM_ENV,
+    NVCC_ENV,
+    NVCC_MSVC_ENV,
+    EMCC_ENV,
+    XCRUN_ENV,
+    APPLE_CLANG_ENV,
+    DEPLOYMENT_TARGET_ENV,
+];
+/// Names the build that a `compiler_env_*` test runs in its subprocess.
+const COMPILER_ENV_CASE: &str = "__CC_TEST_COMPILER_ENV_CASE";
+
+/// Runs the build `case` of a `compiler_env_*` test. These run in a
+/// subprocess, since cc prints its `cargo:` lines to stdout.
+fn compiler_env_build(case: &str) {
+    const LINUX: &str = "x86_64-unknown-linux-gnu";
+    const MSVC: &str = "x86_64-pc-windows-msvc";
+    let mut test = Test::gnu();
+    for shim in [
+        "clang", "clang-cl", "cl", "lib.exe", "zigcc", "nvcc", "ml64", "llvm-ml", "armasm64",
+    ] {
+        test.shim(shim);
+    }
+    // On Apple targets cc takes the SDK and the deployment target from these
+    // instead of asking `xcrun`.
+    let sdk_root = test.td.path().to_owned();
+    test.env.set("SDKROOT", sdk_root);
+    test.env.set("IPHONEOS_DEPLOYMENT_TARGET", "17.0");
+    test.env.set("MACOSX_DEPLOYMENT_TARGET", "11.0");
+    let (target, host, compiler, archiver) = match case {
+        "clang" => (LINUX, LINUX, "clang", "ar"),
+        "zig" => (LINUX, LINUX, "zigcc", "ar"),
+        "msvc" | "masm-ml" | "masm-llvm-ml" => (MSVC, LINUX, "cl", "lib.exe"),
+        "masm-arm" => ("aarch64-pc-windows-msvc", LINUX, "cl", "lib.exe"),
+        "clang-cl" => (MSVC, LINUX, "clang-cl", "lib.exe"),
+        "clang-msvc" => (MSVC, LINUX, "clang", "lib.exe"),
+        "cuda" => (LINUX, LINUX, "nvcc", "ar"),
+        "cuda-msvc" => (MSVC, LINUX, "nvcc", "lib.exe"),
+        "emscripten" => ("wasm32-unknown-emscripten", LINUX, "clang", "ar"),
+        "macos-host" => (LINUX, "aarch64-apple-darwin", "cc", "ar"),
+        "ios" | "ios-no-defaults" => ("aarch64-apple-ios", LINUX, "clang", "ar"),
+        "macos" => ("x86_64-apple-darwin", LINUX, "clang", "ar"),
+        "tvos" => ("aarch64-apple-tvos", LINUX, "clang", "ar"),
+        "watchos" => ("aarch64-apple-watchos", LINUX, "clang", "ar"),
+        "visionos" => ("aarch64-apple-visionos", LINUX, "clang", "ar"),
+        _ => (LINUX, LINUX, "cc", "ar"),
+    };
+    match case {
+        "masm-ml" => test.env.set("CC_MASM_ASM", "ml64"),
+        "masm-llvm-ml" => test.env.set("CC_MASM_ASM", "llvm-ml"),
+        "masm-arm" => test.env.set("CC_MASM_ASM", "armasm64"),
+        _ => {}
+    }
+    let mut build = test.gcc();
+    build
+        .target(target)
+        .host(host)
+        .compiler(test.td.path().join(compiler))
+        .archiver(test.td.path().join(archiver))
+        .cargo_warnings(false);
+    match case {
+        // Two files, compiled twice.
+        "gnu" | "clang" | "zig" | "msvc" | "clang-cl" | "clang-msvc" | "emscripten"
+        | "macos-host" | "ios" | "macos" => {
+            build.file("foo.c").file("bar.c");
+            build.try_compile("foo").unwrap();
+            build.try_compile("foo").unwrap();
+        }
+        "masm-ml" | "masm-llvm-ml" | "masm-arm" => {
+            build.file("foo.asm").file("bar.asm");
+            build.try_compile("foo").unwrap();
+            build.try_compile("foo").unwrap();
+        }
+        "cuda" | "cuda-msvc" => {
+            build.cuda(true).cudart("none").file("foo.cu");
+            build.try_compile("foo").unwrap();
+            build.try_compile("foo").unwrap();
+        }
+        "ios-no-defaults" | "tvos" | "watchos" | "visionos" => {
+            build
+                .file("foo.c")
+                .no_default_flags(true)
+                .try_compile("foo")
+                .unwrap();
+        }
+        "expand" => {
+            // The shim can't preprocess, but the compiler is worked out first.
+            assert!(build.file("foo.c").try_expand().is_err());
+        }
+        "flag-check" => {
+            assert!(build.is_flag_supported("-Wall").unwrap());
+        }
+        "off" => {
+            build
+                .file("foo.c")
+                .emit_rerun_if_env_changed(false)
+                .try_compile("foo")
+                .unwrap();
+        }
+        // Clones that print nothing don't keep the original from printing.
+        "off-clones" => {
+            build.file("foo.c");
+            build
+                .clone()
+                .emit_rerun_if_env_changed(false)
+                .try_compile("foo")
+                .unwrap();
+            build
+                .clone()
+                .cargo_metadata(false)
+                .try_compile("foo")
+                .unwrap();
+            build.try_compile("foo").unwrap();
+        }
+        case => panic!("unknown case {case}"),
+    }
+}
+
+/// The variables that the build `case` of the test `name` printed
+/// `cargo:rerun-if-env-changed` for, in order.
+fn compiler_env_rerun_lines(name: &str, case: &str) -> Vec<String> {
+    const PREFIX: &str = "cargo:rerun-if-env-changed=";
+    let output = GlobalEnv::output(
+        Command::new(env::current_exe().unwrap())
+            .env(COMPILER_ENV_CASE, case)
+            .env_remove("CC_ENABLE_DEBUG_OUTPUT")
+            .args(["--exact", name, "--nocapture"]),
+    );
+    assert!(output.status.success(), "subprocess failed: {:?}", output);
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        // libtest prints the test name on the line of the first output.
+        .filter_map(|line| Some(line[line.find(PREFIX)? + PREFIX.len()..].to_owned()))
+        .collect()
+}
+
+/// Checks that the build `case` of the test `name` printed
+/// `cargo:rerun-if-env-changed` once for each variable in `expected`, and not
+/// for the other variables compilers read.
+#[track_caller]
+fn assert_compiler_env(name: &str, case: &str, expected: &[&[&str]]) {
+    let lines = compiler_env_rerun_lines(name, case);
+    for var in COMPILER_ENV.iter().flat_map(|vars| vars.iter()) {
+        let want = usize::from(expected.iter().any(|vars| vars.contains(var)));
+        let got = lines.iter().filter(|line| line.as_str() == *var).count();
+        assert_eq!(got, want, "{var} in case {case}: {lines:?}");
+    }
+}
+
+/// cc tells Cargo to rerun the build script when a variable that GCC, Clang
+/// or `zig cc` reads by itself changes, once per `Build`, whether it compiles,
+/// expands or checks a flag, and for `xcrun` on macOS hosts.
+#[test]
+fn compiler_env_rerun_gnu() {
+    if let Some(case) = env::var_os(COMPILER_ENV_CASE) {
+        compiler_env_build(case.to_str().unwrap());
+        return;
+    }
+    let name = "compiler_env_rerun_gnu";
+    for case in ["gnu", "expand", "flag-check"] {
+        assert_compiler_env(name, case, &[GCC_AND_CLANG_ENV, GCC_ENV]);
+    }
+    assert_compiler_env(name, "clang", &[GCC_AND_CLANG_ENV, CLANG_ENV]);
+    assert_compiler_env(name, "zig", &[GCC_AND_CLANG_ENV, CLANG_ENV, ZIG_ENV]);
+    assert_compiler_env(name, "macos-host", &[GCC_AND_CLANG_ENV, GCC_ENV, XCRUN_ENV]);
+}
+
+/// The same on MSVC targets, for cl.exe, clang-cl and Clang, and for the
+/// assemblers of `.asm` files.
+#[test]
+fn compiler_env_rerun_msvc() {
+    if let Some(case) = env::var_os(COMPILER_ENV_CASE) {
+        compiler_env_build(case.to_str().unwrap());
+        return;
+    }
+    let name = "compiler_env_rerun_msvc";
+    let cl_exe = [MSVC_INCLUDE_ENV, CL_ENV, CL_EXE_ENV];
+    assert_compiler_env(name, "msvc", &cl_exe);
+    assert_compiler_env(
+        name,
+        "clang-cl",
+        &[
+            GCC_AND_CLANG_ENV,
+            CLANG_ENV,
+            MSVC_INCLUDE_ENV,
+            CLANG_MSVC_ENV,
+            CL_ENV,
+        ],
+    );
+    assert_compiler_env(
+        name,
+        "clang-msvc",
+        &[
+            GCC_AND_CLANG_ENV,
+            CLANG_ENV,
+            MSVC_INCLUDE_ENV,
+            CLANG_MSVC_ENV,
+        ],
+    );
+    assert_compiler_env(
+        name,
+        "masm-ml",
+        &[MSVC_INCLUDE_ENV, CL_ENV, CL_EXE_ENV, MASM_ENV],
+    );
+    // llvm-ml, armasm and armasm64 don't read `ML`.
+    assert_compiler_env(name, "masm-llvm-ml", &cl_exe);
+    assert_compiler_env(name, "masm-arm", &cl_exe);
+}
+
+/// The same for nvcc, besides the variables of the host compiler.
+#[test]
+fn compiler_env_rerun_cuda() {
+    if let Some(case) = env::var_os(COMPILER_ENV_CASE) {
+        compiler_env_build(case.to_str().unwrap());
+        return;
+    }
+    let name = "compiler_env_rerun_cuda";
+    assert_compiler_env(name, "cuda", &[GCC_AND_CLANG_ENV, GCC_ENV, NVCC_ENV]);
+    assert_compiler_env(
+        name,
+        "cuda-msvc",
+        &[GCC_AND_CLANG_ENV, GCC_ENV, NVCC_ENV, NVCC_MSVC_ENV],
+    );
+}
+
+/// The same for emcc on Emscripten targets, besides the variables of Clang.
+#[test]
+fn compiler_env_rerun_emscripten() {
+    if let Some(case) = env::var_os(COMPILER_ENV_CASE) {
+        compiler_env_build(case.to_str().unwrap());
+        return;
+    }
+    assert_compiler_env(
+        "compiler_env_rerun_emscripten",
+        "emscripten",
+        &[GCC_AND_CLANG_ENV, CLANG_ENV, EMCC_ENV],
+    );
+}
+
+/// On Apple targets, also for `xcrun`, Clang's Apple variables and the
+/// target's deployment target, whether cc reads `SDKROOT` and the deployment
+/// target itself or not, and only once when it does.
+#[test]
+fn compiler_env_rerun_apple() {
+    if let Some(case) = env::var_os(COMPILER_ENV_CASE) {
+        compiler_env_build(case.to_str().unwrap());
+        return;
+    }
+    for (case, deployment_target) in [
+        // cc reads both itself.
+        ("ios", "IPHONEOS_DEPLOYMENT_TARGET"),
+        // cc reads neither.
+        ("ios-no-defaults", "IPHONEOS_DEPLOYMENT_TARGET"),
+        ("tvos", "TVOS_DEPLOYMENT_TARGET"),
+        ("watchos", "WATCHOS_DEPLOYMENT_TARGET"),
+        ("visionos", "XROS_DEPLOYMENT_TARGET"),
+        // cc reads only the deployment target.
+        ("macos", "MACOSX_DEPLOYMENT_TARGET"),
+    ] {
+        assert_compiler_env(
+            "compiler_env_rerun_apple",
+            case,
+            &[
+                GCC_AND_CLANG_ENV,
+                CLANG_ENV,
+                XCRUN_ENV,
+                APPLE_CLANG_ENV,
+                &[deployment_target],
+            ],
+        );
+    }
+}
+
+/// None of them with `emit_rerun_if_env_changed(false)`, and such a clone, or
+/// one without `cargo_metadata`, doesn't keep the original from printing them.
+#[test]
+fn compiler_env_rerun_off() {
+    if let Some(case) = env::var_os(COMPILER_ENV_CASE) {
+        compiler_env_build(case.to_str().unwrap());
+        return;
+    }
+    let name = "compiler_env_rerun_off";
+    assert_compiler_env(name, "off", &[]);
+    assert_compiler_env(name, "off-clones", &[GCC_AND_CLANG_ENV, GCC_ENV]);
+}
+
+/// Each `cargo:rerun-if-env-changed` line is printed once per `Build`, even
+/// when cc reads the variable again for another file or another compile.
+#[test]
+fn rerun_if_env_changed_once_per_build() {
+    if let Some(case) = env::var_os(COMPILER_ENV_CASE) {
+        compiler_env_build(case.to_str().unwrap());
+        return;
+    }
+    for case in ["gnu", "msvc", "masm-ml", "cuda", "emscripten", "ios"] {
+        let lines = compiler_env_rerun_lines("rerun_if_env_changed_once_per_build", case);
+        for line in &lines {
+            let count = lines.iter().filter(|other| *other == line).count();
+            assert_eq!(count, 1, "{line} in case {case}: {lines:?}");
+        }
+    }
 }
 
 #[test]
@@ -2005,8 +2451,9 @@ fn compiler_stderr_forwarded_once_per_line() {
     );
 }
 
-/// A logger set with `message_logger` gets cc's warnings, each stderr line and
-/// failed commands, while every other `cargo:` line stays on stdout.
+/// A logger set with `message_logger` gets cc's warnings, each stderr line,
+/// failed commands and compile commands, while every other `cargo:` line stays
+/// on stdout.
 ///
 /// This test runs the builds in a subprocess so we
 /// can capture and assert on the emitted cargo metadata.
@@ -2046,6 +2493,11 @@ fn message_logger() {
             };
             let extra = if let Some(cmd) = extra.downcast_ref::<Command>() {
                 let program = Path::new(cmd.get_program()).file_stem().unwrap();
+                program.to_str().unwrap().to_owned()
+            } else if let Some(cmd) = extra.downcast_ref::<cc::CompileCommand>() {
+                let program = Path::new(cmd.arguments().next().unwrap())
+                    .file_stem()
+                    .unwrap();
                 program.to_str().unwrap().to_owned()
             } else if extra.is::<()>() {
                 "()".to_owned()
@@ -2101,6 +2553,17 @@ fn message_logger() {
             "clone-and-remove" => {
                 build.clone().compile("foo");
                 build.message_logger(None).compile("bar");
+            }
+            #[cfg(feature = "compile-commands")]
+            "compile-commands" => {
+                // The collector passes every message on to the logger, also
+                // when nothing reads its commands.
+                let log = logger.0.lock().unwrap().try_clone().unwrap();
+                let (collector, _) = cc::compile_commands::CompileCommandCollector::new();
+                let collector = collector.forward_to(Box::new(FileLogger(Mutex::new(log))));
+                build
+                    .message_logger(Some(Arc::new(collector)))
+                    .compile("foo");
             }
             "expand" => {
                 // `expand` collects the compiler's output instead of streaming it.
@@ -2200,8 +2663,20 @@ fn message_logger() {
             .map(str::to_owned)
             .collect()
     };
+    // Compile commands aren't printed, so they have no warning to match.
     let texts = |messages: &[[String; 3]]| -> Vec<String> {
-        messages.iter().map(|[_, _, text]| text.clone()).collect()
+        messages
+            .iter()
+            .filter(|[kind, _, _]| kind != "CompileCommand")
+            .map(|[_, _, text]| text.clone())
+            .collect()
+    };
+    let compile_commands = |messages: &[[String; 3]]| -> Vec<String> {
+        messages
+            .iter()
+            .filter(|[kind, extra, _]| kind == "CompileCommand" && extra == "cc")
+            .map(|[_, _, text]| text.clone())
+            .collect()
     };
     let count = |messages: &[[String; 3]], kind: &str, extra: &str, text: &str| {
         messages
@@ -2239,11 +2714,21 @@ fn message_logger() {
         "{messages:#?}"
     );
     assert!(
-        messages
-            .iter()
-            .all(|m| m[0] == stderr_line || (m[0] == "GeneralWarning" && m[1] == "()")),
+        messages.iter().all(|m| m[0] == stderr_line
+            || (m[0] == "GeneralWarning" && m[1] == "()")
+            || (m[0] == "CompileCommand" && m[1] == "cc")),
         "{messages:#?}"
     );
+    // One compile command per object, with the command line as the text.
+    let commands = compile_commands(&messages);
+    assert_eq!(commands.len(), 2, "{messages:#?}");
+    for src in ["\"foo.c\"", "\"bar.c\""] {
+        assert_eq!(
+            commands.iter().filter(|text| text.ends_with(src)).count(),
+            1,
+            "{messages:#?}"
+        );
+    }
     assert_link_lines(&stdout);
 
     // With cargo warnings off, the messages only go to the logger.
@@ -2310,6 +2795,11 @@ fn message_logger() {
             "cc: the shim cannot preprocess"
         ),
         1,
+        "{messages:#?}"
+    );
+    // Preprocessing isn't a compile command.
+    assert!(
+        messages.iter().all(|m| m[0] != "CompileCommand"),
         "{messages:#?}"
     );
 
@@ -2395,6 +2885,21 @@ fn message_logger() {
         4,
         "{stdout:#?}"
     );
+
+    // A compile command collector keeps the warnings on stdout and passes
+    // every message on.
+    #[cfg(feature = "compile-commands")]
+    {
+        let (stdout, messages) = run("compile-commands");
+        assert_eq!(warnings(&stdout), texts(&messages));
+        assert_eq!(
+            count(&messages, stderr_line, "cc", note),
+            2,
+            "{messages:#?}"
+        );
+        assert_eq!(compile_commands(&messages).len(), 2, "{messages:#?}");
+        assert_link_lines(&stdout);
+    }
 }
 
 /// With `cpp_link_stdlib_static`, the C++ stdlib is emitted with `-bundle` once
@@ -3565,20 +4070,252 @@ fn set_envs_snapshot_last_value_wins() {
     test.cmd(0).must_have("-Dlast").must_not_have("-Dfirst");
 }
 
-/// The variables Cargo sets are still read from the process environment.
+/// The variables Cargo sets are read from the snapshot too.
 #[test]
-fn set_envs_snapshot_leaves_cargo_variables() {
+fn set_envs_snapshot_supplies_cargo_variables() {
     let mut test = Test::gnu();
-    let from_process_env = test.td.path().join("from_process_env");
-    test.process_env.set("OUT_DIR", &from_process_env);
+    test.process_env
+        .set("OUT_DIR", test.td.path().join("from_process_env"));
+    let from_snapshot = test.td.path().join("from_snapshot");
     let objects = test
         .gcc_without_out_dir()
-        .set_envs_snapshot([("OUT_DIR", test.td.path().join("from_snapshot"))])
+        .set_envs_snapshot([("OUT_DIR", &from_snapshot)])
         .file("foo.c")
         .try_compile_intermediates()
         .unwrap();
     assert_eq!(objects.len(), 1);
-    assert!(objects[0].starts_with(&from_process_env), "{objects:?}");
+    assert!(objects[0].starts_with(&from_snapshot), "{objects:?}");
+}
+
+/// A `Build` that isn't told its target, host, opt level and debug setting
+/// reads Cargo's variables for them from its snapshot, not from the process
+/// environment.
+#[test]
+fn cargo_variables_come_from_the_snapshot() {
+    let mut test = Test::gnu();
+    for (key, value) in [
+        ("TARGET", "x86_64-unknown-linux-gnu"),
+        ("HOST", "x86_64-unknown-linux-gnu"),
+        ("OPT_LEVEL", "2"),
+        ("DEBUG", "true"),
+    ] {
+        test.process_env.set(key, value);
+    }
+    test.process_env.remove("CARGO_CFG_TARGET_FEATURE");
+    let mut build = cargo_build(&test);
+    build.set_envs_snapshot([
+        ("TARGET", "i686-unknown-linux-gnu"),
+        ("HOST", "i686-unknown-linux-gnu"),
+        ("OPT_LEVEL", "1"),
+        ("DEBUG", "false"),
+        ("CARGO_CFG_TARGET_FEATURE", "crt-static"),
+        // Read only when `HOST` equals `TARGET`. With the process `HOST`, cc
+        // would see a cross build and read `TARGET_CFLAGS` instead.
+        ("HOST_CFLAGS", "-Dsame_host"),
+    ]);
+    build.file("foo.c").try_compile_intermediates().unwrap();
+    test.cmd(0)
+        .must_have("-m32")
+        .must_not_have("-m64")
+        .must_have("-Dsame_host")
+        .must_have("-O1")
+        .must_not_have("-O2")
+        .must_not_have("-g")
+        .must_have("-static");
+}
+
+/// A target set with [`cc::Build::target`] that equals the snapshot's
+/// `TARGET` takes its details from the snapshot's `CARGO_CFG_TARGET_*`, as
+/// when no target is set. Any other target is worked out from its name.
+#[test]
+fn explicit_cargo_target_uses_cargo_cfg() {
+    let test = Test::gnu();
+    // `CARGO_CFG_TARGET_ARCH` disagrees with the name on purpose, so the
+    // flags show which of the two cc used.
+    let vars = [
+        ("TARGET", "x86_64-unknown-linux-gnu"),
+        ("HOST", "x86_64-unknown-linux-gnu"),
+        ("OPT_LEVEL", "0"),
+        ("DEBUG", "false"),
+        ("CARGO_CFG_TARGET_ARCH", "x86"),
+        ("CARGO_CFG_TARGET_VENDOR", "unknown"),
+        ("CARGO_CFG_TARGET_OS", "linux"),
+        ("CARGO_CFG_TARGET_ENV", "gnu"),
+    ];
+    for target in ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"] {
+        cargo_build(&test)
+            .set_envs_snapshot(vars)
+            .target(target)
+            .file("foo.c")
+            .try_compile_intermediates()
+            .unwrap();
+    }
+    test.cmd(0).must_have("-m32").must_not_have("-m64");
+    test.cmd(1).must_have("-m64").must_not_have("-m32");
+}
+
+/// Cargo's variables are read once, with the rest of the environment, so a
+/// change to the process environment after the first use doesn't reach the
+/// `Build`, while one made before it does.
+#[test]
+fn cargo_variables_are_read_once() {
+    let mut test = Test::gnu();
+    test.clear_process_env();
+    for (key, value) in [
+        ("TARGET", "x86_64-unknown-linux-gnu"),
+        ("HOST", "x86_64-unknown-linux-gnu"),
+        ("OPT_LEVEL", "0"),
+        ("DEBUG", "false"),
+    ] {
+        test.process_env.set(key, value);
+    }
+    test.process_env.remove("CARGO_CFG_TARGET_FEATURE");
+    let mut build = cargo_build(&test);
+    build.file("foo.c");
+    test.process_env
+        .set("CARGO_CFG_TARGET_FEATURE", "crt-static");
+    build.try_compile_intermediates().unwrap();
+    test.process_env.remove("CARGO_CFG_TARGET_FEATURE");
+    build.try_compile_intermediates().unwrap();
+    test.cmd(0).must_have("-static");
+    test.cmd(1).must_have("-static");
+}
+
+/// A `set_envs_snapshot` after the `Build` was used with the target from the
+/// process environment switches it to the target in `vars`, both where cc
+/// reads `TARGET` itself (`CFLAGS_<target>`) and where it uses the target
+/// worked out from it (`-m32`).
+#[test]
+fn set_envs_snapshot_replaces_cargo_target() {
+    const TARGET_FLAGS: [(&str, &str); 2] = [
+        ("CFLAGS_x86_64_unknown_linux_gnu", "-Dfor_x86_64"),
+        ("CFLAGS_i686_unknown_linux_gnu", "-Dfor_i686"),
+    ];
+    let mut test = Test::gnu();
+    test.clear_process_env();
+    for (key, value) in [
+        ("TARGET", "x86_64-unknown-linux-gnu"),
+        ("HOST", "x86_64-unknown-linux-gnu"),
+        ("OPT_LEVEL", "0"),
+        ("DEBUG", "false"),
+    ]
+    .into_iter()
+    .chain(TARGET_FLAGS)
+    {
+        test.process_env.set(key, value);
+    }
+    test.process_env.remove("CARGO_CFG_TARGET_FEATURE");
+    let mut build = cargo_build(&test);
+    build.file("foo.c");
+    build.try_compile_intermediates().unwrap();
+
+    build.set_envs_snapshot(
+        [
+            ("TARGET", "i686-unknown-linux-gnu"),
+            ("HOST", "i686-unknown-linux-gnu"),
+            ("OPT_LEVEL", "0"),
+            ("DEBUG", "false"),
+        ]
+        .into_iter()
+        .chain(TARGET_FLAGS),
+    );
+    build.try_compile_intermediates().unwrap();
+
+    test.cmd(0)
+        .must_have("-m64")
+        .must_not_have("-m32")
+        .must_have("-Dfor_x86_64")
+        .must_not_have("-Dfor_i686");
+    test.cmd(1)
+        .must_have("-m32")
+        .must_not_have("-m64")
+        .must_have("-Dfor_i686")
+        .must_not_have("-Dfor_x86_64");
+}
+
+/// [`cc::Build::env`] reaches the tools cc runs, but not the variables Cargo
+/// sets that cc reads itself.
+#[test]
+fn build_env_does_not_set_cargo_variables() {
+    let test = Test::gnu();
+    cargo_build(&test)
+        .set_envs_snapshot([
+            ("TARGET", "x86_64-unknown-linux-gnu"),
+            ("HOST", "x86_64-unknown-linux-gnu"),
+            ("OPT_LEVEL", "0"),
+            ("DEBUG", "false"),
+        ])
+        .env("TARGET", "i686-unknown-linux-gnu")
+        .env("OPT_LEVEL", "3")
+        .env("CARGO_CFG_TARGET_FEATURE", "crt-static")
+        .file("foo.c")
+        .try_compile_intermediates()
+        .unwrap();
+    test.cmd(0)
+        .must_have("-m64")
+        .must_not_have("-m32")
+        .must_have("-O0")
+        .must_not_have("-O3")
+        .must_not_have("-static");
+}
+
+/// Cargo doesn't need to be told about the variables it sets, so cc prints no
+/// `rerun-if-env-changed` line for them.
+///
+/// This test runs the build in a subprocess so we can read the metadata it
+/// prints.
+#[test]
+fn cargo_variables_print_no_rerun_lines() {
+    const CARGO_VARS: [(&str, &str); 6] = [
+        ("TARGET", "x86_64-unknown-linux-gnu"),
+        ("HOST", "x86_64-unknown-linux-gnu"),
+        ("OPT_LEVEL", "0"),
+        ("DEBUG", "false"),
+        ("CARGO_CFG_TARGET_FEATURE", "crt-static"),
+        ("CARGO_ENCODED_RUSTFLAGS", "-Cforce-frame-pointers=true"),
+    ];
+    if env::var_os("__CC_TEST_CARGO_VARIABLES_RERUN").is_some() {
+        let test = Test::gnu();
+        cargo_build(&test)
+            .set_envs_snapshot(CARGO_VARS)
+            .file("foo.c")
+            .try_compile_intermediates()
+            .unwrap();
+        test.cmd(0).must_have("-static");
+        return;
+    }
+
+    let output = GlobalEnv::output(
+        Command::new(env::current_exe().unwrap())
+            .env("__CC_TEST_CARGO_VARIABLES_RERUN", "1")
+            .args([
+                "--exact",
+                "cargo_variables_print_no_rerun_lines",
+                "--nocapture",
+            ]),
+    );
+    assert!(output.status.success(), "subprocess failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rerun_lines: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.split("cargo:rerun-if-env-changed=").nth(1))
+        .collect();
+    // cc's own variables still get one.
+    assert!(rerun_lines.contains(&"CFLAGS"), "{stdout}");
+    for (key, _) in CARGO_VARS {
+        assert!(!rerun_lines.contains(&key), "{key}: {stdout}");
+    }
+}
+
+/// A `Build` for the shim compiler that leaves its target, host, opt level,
+/// debug setting and environment to Cargo's variables, as in a build script.
+fn cargo_build(test: &Test) -> cc::Build {
+    let mut build = cc::Build::new();
+    build
+        .compiler(test.td.path().join("cc"))
+        .out_dir(test.td.path())
+        .env("CC_SHIM_OUT_DIR", test.td.path());
+    build
 }
 
 #[test]
@@ -3614,9 +4351,136 @@ fn msvc_create_archive() {
     assert_eq!(library, test.td.path().join("libfoo.a"));
     let mut out = std::ffi::OsString::from("-out:");
     out.push(&library);
-    test.cmd(1).must_have(out).must_have(&objects[0]);
+    test.cmd(1)
+        .must_have(out)
+        .must_have(objects[0].file_name().unwrap());
     // As with `compile`, the library is also available as `foo.lib`.
     assert!(test.td.path().join("foo.lib").is_file());
+}
+
+#[test]
+fn msvc_archive_members_are_relative_to_out_dir() {
+    let test = Test::msvc();
+    let elsewhere = test.td.path().parent().unwrap().join("elsewhere.o");
+    test.gcc()
+        .file("foo.c")
+        .object(&elsewhere)
+        .object("relative.o")
+        .compile("foo");
+
+    // lib.exe names each member by the path it is given, so the objects in
+    // OUT_DIR are passed relative to it and the archive doesn't change with
+    // the location of the build. Objects from elsewhere stay absolute.
+    let ar = test.cmd(1);
+    assert_eq!(
+        ar.cwd.canonicalize().unwrap(),
+        test.td.path().canonicalize().unwrap()
+    );
+    let mut out = std::ffi::OsString::from("-out:");
+    out.push(test.td.path().join("libfoo.a"));
+    ar.must_have(out)
+        .must_have("9bb0a3195b9dd27a-foo.o")
+        .must_have(&elsewhere)
+        .must_have(env::current_dir().unwrap().join("relative.o"));
+}
+
+#[test]
+fn msvc_archive_with_ar_flags_keeps_the_current_directory() {
+    let test = Test::msvc();
+    test.gcc()
+        .file("foo.c")
+        .ar_flag("-def:foo.def")
+        .compile("foo");
+
+    // The flags may name files relative to the current directory.
+    let ar = test.cmd(1);
+    assert_eq!(ar.cwd, env::current_dir().unwrap());
+    ar.must_have(test.td.path().join("9bb0a3195b9dd27a-foo.o"));
+}
+
+#[test]
+fn msvc_archive_with_args_in_ar_keeps_the_current_directory() {
+    for (var, ar, args) in [
+        ("AR", "lib.exe", false),
+        ("AR", "lib.exe -def:foo.def", true),
+        ("AR_x86_64-pc-windows-msvc", "lib.exe -def:foo.def", true),
+    ] {
+        // `Test::msvc` sets the archiver itself, so it would ignore `AR`.
+        let mut test = Test::msvc_autodetect();
+        test.env.set(var, ar);
+        test.gcc()
+            .compiler(test.td.path().join("cl"))
+            .file("foo.c")
+            .compile("foo");
+
+        // Like `ARFLAGS`, the arguments in `AR` may name files relative to the
+        // current directory.
+        let ar = test.cmd(1);
+        let object = test.td.path().join("9bb0a3195b9dd27a-foo.o");
+        if args {
+            assert_eq!(ar.cwd, env::current_dir().unwrap(), "{var}");
+            ar.must_have("-def:foo.def").must_have(object);
+        } else {
+            assert_eq!(
+                ar.cwd.canonicalize().unwrap(),
+                test.td.path().canonicalize().unwrap()
+            );
+            ar.must_have(object.file_name().unwrap());
+        }
+    }
+}
+
+#[test]
+fn msvc_archive_arm64ec_members_are_relative_to_out_dir() {
+    // `Test::msvc` sets the archiver itself, so cc wouldn't add `/machine:`.
+    let test = Test::msvc_autodetect();
+    test.gcc()
+        .target("arm64ec-pc-windows-msvc")
+        .compiler(test.td.path().join("cl"))
+        .file("foo.c")
+        .compile("foo");
+
+    // cc adds `/machine:arm64ec` itself; only arguments from the user keep the
+    // current directory.
+    let ar = test.cmd(1);
+    assert_eq!(
+        ar.cwd.canonicalize().unwrap(),
+        test.td.path().canonicalize().unwrap()
+    );
+    ar.must_have("/machine:arm64ec")
+        .must_have("9bb0a3195b9dd27a-foo.o");
+}
+
+#[test]
+fn msvc_archive_batches_are_relative_to_out_dir() {
+    let test = Test::msvc();
+    // The archiver takes about 4000 bytes of paths at a time, so these go in
+    // two batches: `foo.o` and the first, then the second and `relative.o`.
+    let objects: Vec<_> = (0..2)
+        .map(|i| test.td.path().join(format!("{i:0>3000}.o")))
+        .collect();
+    test.gcc()
+        .file("foo.c")
+        .object(&objects[0])
+        .object(&objects[1])
+        .object("relative.o")
+        .compile("foo");
+
+    // Every batch runs in OUT_DIR, and a relative object from elsewhere is
+    // still passed absolute.
+    for i in 1..=2 {
+        let ar = test.cmd(i);
+        assert_eq!(
+            ar.cwd.canonicalize().unwrap(),
+            test.td.path().canonicalize().unwrap()
+        );
+    }
+    test.cmd(1)
+        .must_have("9bb0a3195b9dd27a-foo.o")
+        .must_have(objects[0].file_name().unwrap());
+    test.cmd(2)
+        .must_have(objects[1].file_name().unwrap())
+        .must_have(env::current_dir().unwrap().join("relative.o"));
 }
 
 #[test]

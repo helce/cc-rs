@@ -8,7 +8,7 @@ mod support;
 fn sanity() {
     // Sanity check - no flags
     let mut test = Test::gnu();
-    test.process_env.set("CARGO_ENCODED_RUSTFLAGS", "");
+    test.env.set("CARGO_ENCODED_RUSTFLAGS", "");
     test.gcc().file("foo.c").compile("foo");
     test.cmd(0)
         .must_not_have("-fno-omit-frame-pointer")
@@ -23,7 +23,7 @@ fn sanity() {
 fn inherits_rustflags() {
     // Correctly inherits flags from rustc
     let mut test = Test::gnu();
-    test.process_env.set(
+    test.env.set(
         "CARGO_ENCODED_RUSTFLAGS",
         "-Cforce-frame-pointers=true\u{1f}-Ccode-model=small\u{1f}-Csoft-float\u{1f}-Cdwarf-version=5\u{1f}-Zstack-protector=strong",
     );
@@ -40,7 +40,7 @@ fn inherits_rustflags() {
 #[test]
 fn inherits_target_features() {
     let mut test = Test::gnu();
-    test.process_env.set(
+    test.env.set(
         "CARGO_ENCODED_RUSTFLAGS",
         "-Ctarget-feature=+ssse3,+avx\u{1f}-C\u{1f}target-feature=+avx2,-sse4a,-sse2,+crt-static,+not-a-feature",
     );
@@ -61,7 +61,7 @@ fn inherits_target_features() {
 fn no_stack_protector() {
     // Do *not* propagate -Zstack-protector=none
     let mut test = Test::gnu();
-    test.process_env.set(
+    test.env.set(
         "CARGO_ENCODED_RUSTFLAGS",
         "-Cforce-frame-pointers=true\u{1f}-Ccode-model=small\u{1f}-Csoft-float\u{1f}-Cdwarf-version=5\u{1f}-Zstack-protector=none",
     );
@@ -81,7 +81,7 @@ fn does_not_inherit_profile_flags() {
     // C compiler's LLVM instrprof runtime and profile format may not match rustc's.
     // https://github.com/rust-lang/cc-rs/issues/1986
     fn check(mut test: Test) {
-        test.process_env.set(
+        test.env.set(
             "CARGO_ENCODED_RUSTFLAGS",
             "-Cprofile-generate=/tmp/pgo-data\u{1f}-Cprofile-use=/tmp/merged.profdata\u{1f}-Cforce-frame-pointers=true",
         );
@@ -99,4 +99,62 @@ fn does_not_inherit_profile_flags() {
     let mut clang = Test::clang();
     clang.env.set("CC", "clang");
     check(clang);
+}
+
+#[test]
+fn disabled_linker_plugin_lto_does_not_enable_clang_lto() {
+    for value in ["n", "no", "off", "false"] {
+        let mut test = Test::clang();
+        test.env.set("CC", "clang");
+        test.env.set(
+            "CARGO_ENCODED_RUSTFLAGS",
+            format!("-Clinker-plugin-lto={value}"),
+        );
+        test.gcc().file("foo.c").compile("foo");
+        test.cmd_for_source("foo.c").must_not_have("-flto=thin");
+    }
+}
+
+#[test]
+fn enabled_linker_plugin_lto_preserves_clang_lto() {
+    for flags in [
+        "-Clinker-plugin-lto",
+        "-Clinker-plugin-lto=yes",
+        "-Clinker-plugin-lto=/path/to/LLVMgold.so",
+        "-Clinker-plugin-lto=no\u{1f}-Clinker-plugin-lto",
+    ] {
+        let mut test = Test::clang();
+        test.env.set("CC", "clang");
+        test.env.set("CARGO_ENCODED_RUSTFLAGS", flags);
+        test.gcc().file("foo.c").compile("foo");
+        test.cmd_for_source("foo.c").must_have("-flto=thin");
+    }
+}
+
+#[test]
+fn linker_plugin_lto_prefers_clang() {
+    for (flags, program) in [
+        ("-Clinker-plugin-lto", "clang"),
+        ("-Clinker-plugin-lto=yes", "clang"),
+        ("-Clinker-plugin-lto=/path/to/LLVMgold.so", "clang"),
+        ("-C\u{1f}linker-plugin-lto", "clang"),
+        ("-Clinker-plugin-lto=no\u{1f}-Clinker-plugin-lto", "clang"),
+        ("-Clinker-plugin-lto=n", "cc"),
+        ("-Clinker-plugin-lto=no", "cc"),
+        ("-Clinker-plugin-lto=off", "cc"),
+        ("-Clinker-plugin-lto=false", "cc"),
+        ("--codegen\u{1f}linker-plugin-lto=no", "cc"),
+        ("-Clinker-plugin-lto\u{1f}-Clinker-plugin-lto=no", "cc"),
+        ("-L/opt/linker-plugin-lto/lib", "cc"),
+        ("", "cc"),
+    ] {
+        let mut test = Test::gnu();
+        test.shim("clang");
+        // cc looks for `clang` on the inherited `PATH`, not on the one set
+        // with `Build::env`.
+        test.env.set("PATH", test.td.path());
+        test.env.set("CARGO_ENCODED_RUSTFLAGS", flags);
+        test.gcc().file("foo.c").compile("foo");
+        test.cmd_for_source("foo.c").must_run(program);
+    }
 }
