@@ -193,6 +193,7 @@ const ARCH_PREFIXES: &[(&str, &str)] = &[
     ("pulley32", "pulley32"),
     // https://github.com/Clever-ISA/Clever-ISA
     ("clever", "clever"),
+    ("e2k", "e2k"), // e2kv2...e2k8v7
     // Supported by gcc, but not LLVM.
     ("alpha", "alpha"), // DEC Alpha
     ("sh", "sh"),       // SuperH
