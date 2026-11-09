@@ -3406,7 +3406,7 @@ impl Build {
     fn add_sanitizer_flags(&self, cmd: &mut Tool, target: &TargetInfo<'_>) {
         // The target (arch, os, env, abi) CI tests each compiler with.
         let tested = match cmd.family {
-            ToolFamily::Gnu | ToolFamily::Clang { .. } => ("x86_64", "linux", "gnu", ""),
+            ToolFamily::Gnu { .. } | ToolFamily::Clang { .. } => ("x86_64", "linux", "gnu", ""),
             ToolFamily::Msvc { clang_cl: false } => ("x86_64", "windows", "msvc", ""),
             ToolFamily::Msvc { clang_cl: true } => return,
         };
@@ -5164,7 +5164,7 @@ impl Build {
     /// `compiler`, or a program it runs, reads by itself and that changes what
     /// it compiles or which programs it runs. Their values aren't used.
     fn rerun_if_compiler_env_changed(&self, compiler: &Tool, target: &TargetInfo<'_>) {
-        let gcc = compiler.family == ToolFamily::Gnu;
+        let gcc = compiler.family.is_gnu();
         let clang_cl = compiler.family == ToolFamily::Msvc { clang_cl: true };
         let cl_exe = compiler.family == ToolFamily::Msvc { clang_cl: false };
         // Clang in every driver mode.
